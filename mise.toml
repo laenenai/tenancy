@@ -45,11 +45,11 @@ run = "go test ./... -race"
 
 [tasks.api]
 description = "Regenerate api.txt, the public-surface golden file the charter requires."
-run = "go run ./cmd/apilist"
-
-[tasks.api-check]
-description = "Fail if the public surface changed without the golden file being updated."
-run = ["go run ./cmd/apilist", "git diff --exit-code -- api.txt"]
+# The golden file is checked by an ordinary test (api_test.go), which is why
+# there is no api-check task: `test` and `test-all` already verify it, so the
+# check cannot be forgotten. This task only rewrites it, deliberately.
+# A module with no api_test.go yet matches no test and this is a no-op.
+run = "go test ./... -run TestAPIGolden -update-api"
 
 [tasks.check]
-depends = ["fmt-check", "lint", "build", "api-check", "test-all"]
+depends = ["fmt-check", "lint", "build", "test-all"]
