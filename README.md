@@ -1,8 +1,12 @@
 # tenancy
 
-Which database, bucket and region a tenant's data lives in: tenant and pool registry, resolution, residency attributes.
+Who the tenants are, where their data lives, and a pgx connection already
+scoped to exactly one of them — failing closed if it is not.
 
-**Not in scope:** Authorization. Quota enforcement — it stores the pool, not the rules.
+Registry tables and migrations, tenant→pool resolution with caching, residency
+attributes, pgx pool and handle lifecycle, RLS session context, tracing.
 
-See [CHARTER.md](CHARTER.md) for the boundary and how it is enforced, and
-`api.txt` for the public surface.
+**Not in scope:** authorization rules (`iam`), key material (`keyring`),
+migrations beyond its own registry tables, query building, domain concepts.
+
+See [CHARTER.md](CHARTER.md).
