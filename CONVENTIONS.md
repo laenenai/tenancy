@@ -114,8 +114,31 @@ charter's adoption row should say so.
   else.
 - A root facade file (`<module>.go`) re-exports what a consumer must name, as
   **type aliases** so a value the internals produce and a value the consumer
-  holds are the identical type. It declares aliases and sentinel errors only —
-  no behaviour, no constructors beyond the single `Open`.
+  holds are the identical type.
+- **The facade carries aliases, sentinels, exported constants, AND the module's
+  entry points** — its constructor(s) and any free function a consumer must be
+  able to call. What it must not carry is *logic*.
+
+  Corrected 2026-10-23: an earlier version said "aliases and sentinel errors
+  only", copied from `cas/cas.go`. But that file says in its own doc comment
+  that it is aliases-only *because a later task is the one that adds the
+  constructor* — it is a staging note, not a permanent rule, and promoting it
+  to a convention produced a real defect: in `audit`, `Verify`,
+  `VerifyEntries`, `NewMemory` and `BreakKind`'s constants ended up unreachable
+  from outside the module, so a consumer could not use it. A facade that hides
+  what the module is for is not a facade. Reachability is checked by `api.txt`:
+  if a consumer would need to name it, it belongs in the golden file.
+
+### Postgres timestamp precision
+
+**Canonicalize every timestamp to UTC at microsecond precision** before it
+enters a digest, an idempotency key, or any equality comparison. Postgres
+`timestamptz` holds microseconds; a value carrying nanoseconds round-trips
+equal in memory and unequal through the database. Two modules hit this
+independently on the same day — `audit`, where a chain committing to
+nanoseconds would verify in memory and then report every persisted entry as
+tampered, and `meter`, where it would have made a conformance suite pass for
+the wrong reason.
 - One `Open(ctx, Config)` constructor. Config is a struct, validated, with
   typed errors.
 - Adapters behind ports. The core performs no I/O and is unit-testable with
