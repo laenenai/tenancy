@@ -57,6 +57,49 @@ repos read as one codebase.
   adapter is forced to exercise them (`cas`'s `NoPayloadContentLeaksInErrors`
   is the pattern to copy).
 
+## Integration tests and containers
+
+`cas` already settled this and every module follows it rather than inventing a
+second approach.
+
+- **`testcontainers-go` is the harness**, not a hand-rolled docker-compose
+  dependency in tests. `cas` pins
+  `github.com/testcontainers/testcontainers-go/modules/postgres`.
+- **The image is `pgvector/pgvector:pg18`, not stock `postgres`** — vector
+  columns exist in this system and the stock image lacks the extension, so a
+  harness that uses it passes locally and fails where it matters.
+- **Each test gets its own uniquely named, isolated database**, created and
+  migrated fresh, so tests run in parallel with no shared state and no
+  truncation between them. Do not share one database and clean up after.
+- **`TEST_DATABASE_URL`, when set, is used instead of starting a container**,
+  so CI and a developer with a running stack skip container startup.
+- **The harness skips under `testing.Short()`**, which is why `mise test` is a
+  genuine no-container inner loop and `mise test-all` is the full suite. Skip at
+  run time; never behind a build tag.
+- **The shared harness lives in `tenancy`** (see its charter), because tenant
+  scoping and RLS are what it exists to test and a second consumer now needs
+  it. `cas/internal/testdb` keeps its copy until the post-alpha swap; that is
+  the agreed staged migration, not divergence.
+
+**What needs a real integration test, not an in-memory adapter.** An in-memory
+adapter proves the *contract*; it cannot prove the *enforcement*. Anything whose
+correctness is a property of the database or of an external service must be
+exercised against the real thing:
+
+- RLS fail-closed behaviour — the central claim of `tenancy`, and unprovable
+  without Postgres.
+- Any SQL predicate whose plan matters: assert via `EXPLAIN` that it is an
+  index join, because a budget met on 1,000 rows says nothing.
+- Transactional semantics, including whether an append can join a caller's
+  transaction.
+- Migrations, applied forward on a fresh database.
+- Every external-service adapter against that service's real image —
+  **`openbao/openbao:2.2.1` for `keyring`'s transit adapter**, which `cas`'s
+  dev stack already runs.
+
+A module whose only adapter is in-memory is an unfinished module, and its
+charter's adoption row should say so.
+
 ## Package layout
 
 - All domain types and value objects live in `internal/domain` and nowhere
