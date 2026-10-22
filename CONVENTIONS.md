@@ -16,8 +16,16 @@ repos read as one codebase.
 - **`forbidigo` forbids `fmt.Print*` and `panic`** outside `cmd/`. Return
   errors; log through the injected logger.
 - `mise` tasks, same names and same meanings as `cas`: `fmt`, `fmt-check`,
-  `lint`, `generate`, `test`, `build`, `test-all`, `check`.
-  `check` depends on `fmt-check lint build test-all` and is the gate.
+  `lint`, `test`, `build`, `test-all`, plus `api` / `api-check`, and `check`
+  as the gate — it depends on `fmt-check lint build api-check test-all`.
+  `api-check` is in the gate because the charter requires `api.txt` to be
+  diffed in CI and the gate is where that belongs.
+- **A module's `mise.toml` is not a copy of cas's.** cas's `migrate`, `dev`,
+  `up`, `down`, `reset`, `db` and observability tasks reference `./cmd/casd`
+  and `deploy/compose/`, and its `generate` runs `sqlc`/`buf`; none of that
+  exists in a library module. A task list with dangling entries trains people
+  to ignore task lists. A module that later grows migrations or generated code
+  adds the task it actually needs, under cas's name for it.
 
 ## Testing
 
