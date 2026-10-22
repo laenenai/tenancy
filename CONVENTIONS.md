@@ -25,11 +25,32 @@ repos read as one codebase.
   databases.** Tests requiring either **skip at run time** via `testing.Short()`
   — **never behind a build tag.** `mise test-all` runs everything.
 - Table-driven tests. `t.Parallel()` where the test allows it.
-- **Every port ships a conformance suite in `suite.go`**, exported as
+- **Unit tests of a package live in `*_test.go`**, as ordinary Go.
+- **Every port additionally ships a conformance suite**, exported as
   `RunXxxSuite(t *testing.T, newXxx func(t *testing.T) Xxx)`. The factory is
   called **once per subtest with that subtest's own `*testing.T`**, so an
   adapter registers its setup and teardown with `t.Cleanup` inside the factory
   and every subtest gets fresh isolated state.
+- **The suite lives in a sibling `<module>test` package** — `keyringtest`,
+  `audittest`, `metertest`, `iamtest — not in a `_test.go` file and not in the
+  production package. Two reasons, and both are forced:
+  - Identifiers in `_test.go` files are **not importable from outside the
+    package**, and the suite must be callable from another package *and from
+    another module* — CAS's seam runs `iam`'s suite against CAS's own
+    authorization code, which is what makes "adopted" testable instead of
+    asserted.
+  - A non-`_test.go` file that imports `testing` makes `testing` a dependency
+    of the **production** package, so every consumer's binary links it and
+    inherits its flag registrations. A sibling package keeps it out of the
+    production import graph.
+
+  This is the standard library's own pattern: `testing/fstest.TestFS` verifies
+  any `fs.FS`, and `httptest` is a sibling of `http` rather than part of it.
+  **Note:** `cas/internal/blob/suite.go` puts the suite *in* `package blob`.
+  That is tolerable for an `internal/` package nobody imports, and it is the
+  one place these conventions deliberately diverge from `cas`. First increments
+  that followed the in-package shape get moved; new code uses the sibling
+  package.
 - **The suite, not the interface, is the authoritative description of the
   contract's edge-case behaviour.** Say so in the package doc.
 - Security invariants get their own named subtest in the suite, so every
