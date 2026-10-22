@@ -1,0 +1,79 @@
+[tools]
+go            = "1.25.6"
+buf           = "1.65.0"
+sqlc          = "1.31.1"
+golangci-lint = "2.11.4"
+gofumpt       = "0.9.2"
+
+[env]
+CGO_ENABLED = "0"
+
+[tasks.fmt]
+run = "gofumpt -l -w $(find . -path ./.claude -prune -o -name '*.go' -print)"
+
+[tasks.fmt-check]
+run = "test -z \"$(gofumpt -l $(find . -path ./.claude -prune -o -name '*.go' -print))\""
+
+[tasks.lint]
+run = "golangci-lint run"
+
+[tasks.generate]
+run = ["sqlc generate", "buf generate"]
+
+[tasks.test]
+description = "Inner loop: no containers, no databases. Skips at run time, never behind a build tag."
+run = "go test ./... -short"
+
+[tasks.build]
+description = "Proves the shipped binary is cgo-free: inherits CGO_ENABLED=0 from [env]."
+run = "go build ./..."
+
+[tasks.test-all]
+description = "Full suite including container- and database-backed tests."
+# CGO_ENABLED=0 is a *release* constraint (cgo-free, cross-compilable binary),
+# not a test constraint. The race detector requires cgo, and race detection is
+# worth more in tests than cgo-freedom is. The cgo-free guarantee is enforced by
+# the `build` task above, which `check` also depends on — so the property is now
+# actually verified instead of merely asserted.
+env = { CGO_ENABLED = "1" }
+run = "go test ./... -race"
+
+[tasks.check]
+depends = ["fmt-check", "lint", "build", "test-all"]
+
+[tasks.migrate]
+run = "go run ./cmd/casd migrate up"
+
+[tasks.dev]
+description = "Run casd against the local dev stack, honoring CAS_POSTGRES_PORT overrides."
+# dev/config.yaml's postgres.dsn hardcodes the conventional default port so
+# the file is readable on its own, but config.Load applies environment
+# overrides after the file (see internal/config/load.go), so exporting
+# CAS_POSTGRES_DSN here — built from the same CAS_POSTGRES_PORT variable
+# `mise run up` reads (see deploy/compose/.env.example) — always wins and
+# keeps the two in sync without editing the file by hand.
+run = "CAS_POSTGRES_DSN=postgres://cas:cas@localhost:${CAS_POSTGRES_PORT:-5432}/cas?sslmode=disable go run ./cmd/casd serve --config ./dev/config.yaml"
+
+[tasks.up]
+description = "Start the local dev stack (Postgres + SeaweedFS S3 + OpenBao) in the background."
+run = "docker compose -f deploy/compose/compose.yaml -p cas up -d"
+
+[tasks.down]
+description = "Stop the local dev stack, keeping its data volumes."
+run = "docker compose -f deploy/compose/compose.yaml -p cas down"
+
+[tasks.reset]
+description = "Stop the local dev stack and destroy its data volumes."
+run = "docker compose -f deploy/compose/compose.yaml -p cas down -v"
+
+[tasks.db]
+description = "Open a psql shell into the local dev stack's Postgres."
+run = "docker compose -f deploy/compose/compose.yaml -p cas exec postgres psql -U cas -d cas"
+
+[tasks.up-observability]
+description = "Start the observability dev backend (OpenObserve) in the background, in addition to `mise run up`."
+run = "docker compose -f deploy/compose/compose.yaml -p cas --profile observability up -d"
+
+[tasks.down-observability]
+description = "Stop the observability dev backend, keeping its data volume."
+run = "docker compose -f deploy/compose/compose.yaml -p cas --profile observability down"

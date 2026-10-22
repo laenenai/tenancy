@@ -1,0 +1,54 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - revive
+    - gosec
+    - bodyclose
+    - rowserrcheck
+    - sqlclosecheck
+    - contextcheck
+    - errorlint
+    - noctx
+    - gocritic
+    - forbidigo
+    - depguard
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: '^fmt\.Print.*$'
+          msg: "use structured logging instead of fmt.Print*"
+        - pattern: '^panic$'
+          msg: "panic is forbidden outside main; return a typed error instead"
+    depguard:
+      rules:
+        # internal/obs is the only package that creates OTel metric
+        # instruments or wires the metric SDK. Its own NewCounter /
+        # NewUpDownCounter / NewHistogram enforce the cardinality
+        # discipline (no tenant/document/blob/principal/job id as a
+        # metric attribute) at both instrument-creation and measurement
+        # time; calling go.opentelemetry.io/otel/metric directly from
+        # anywhere else bypasses that enforcement entirely, so it is
+        # denied at the import level rather than relying on convention.
+        otel-metric-boundary:
+          list-mode: lax
+          files:
+            - "!**/internal/obs/**"
+          deny:
+            - pkg: go.opentelemetry.io/otel/metric
+              desc: "create instruments via internal/obs.NewCounter/NewUpDownCounter/NewHistogram instead of the OTel metric API directly"
+            - pkg: go.opentelemetry.io/otel/sdk/metric
+              desc: "only internal/obs wires the metric SDK (see obs.Setup)"
+  exclusions:
+    rules:
+      # panic is allowed only in the main package itself: files directly
+      # inside cmd/<binary>/ (not any subpackage nested under it). fmt.Print*
+      # stays forbidden everywhere, including main, so this rule is scoped to
+      # the panic-specific forbidigo message only.
+      - path: '^cmd/[^/]+/[^/]+\.go$'
+        linters:
+          - forbidigo
+        text: '`panic` forbidden'
