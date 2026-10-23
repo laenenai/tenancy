@@ -68,6 +68,8 @@ func MigrationStatus(ctx context.Context, cfg MigrateConfig) ([]Applied, error)
 
 func NewFixedClock(t time.Time) *FixedClock
 
+func NewOpener(cfg PoolConfig) Opener
+
 type NewPool = registry.NewPool
 
 func NewPoolID(clock Clock) PoolID
@@ -208,6 +210,12 @@ func (RoleCheck) Usable() bool
 
 package tenancytest // tenancytest
 
+type CredentialSource struct {
+	Credentials tenancy.Credentials
+	Deployment Deployment
+	Dynamic bool
+}
+
 type Deployment struct {
 	MigrationDSN tenancy.DSN
 	RuntimeDSN tenancy.DSN
@@ -223,6 +231,8 @@ func (Deployment) MarshalJSON() ([]byte, error)
 func (Deployment) String() string
 
 func NoSecretLeaksInAnyRendering(t *testing.T, v any, material []byte)
+
+func RunCredentialsSuite(t *testing.T, newSource func(t *testing.T) CredentialSource)
 
 func RunTenancySuite(t *testing.T, newDeployment func(t *testing.T) Deployment)
 

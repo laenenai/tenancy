@@ -394,6 +394,17 @@ func AssertRLSCoverage(ctx context.Context, db DDL, schema string) ([]string, er
 	return pg.AssertRLSCoverage(ctx, db, schema)
 }
 
+// NewOpener returns the Opener this module uses when Config.Opener is
+// empty: it hands a pool row's MetadataDSN and the credential issued for it
+// to the one function audited never to let either reach an error.
+//
+// It is exported for two callers. A consumer wrapping the default — to count
+// pools, to add a dial-time hook — needs the default to wrap. And the
+// conformance suite opens a connection as an issued credential, which has to
+// go through the production path or it would be asserting things about its
+// own five lines of pgx setup instead. See pool.NewOpener.
+func NewOpener(cfg PoolConfig) Opener { return pool.NewOpener(cfg) }
+
 // IsRLSViolation reports whether err is Postgres refusing a statement
 // under a policy's WITH CHECK, rather than under any other mechanism. See
 // pg.IsRLSViolation.

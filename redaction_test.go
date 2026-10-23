@@ -16,11 +16,13 @@ package tenancy_test
 // this file imports internal/pg directly rather than going through resolution.
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/laenenai/tenancy"
+	"github.com/laenenai/tenancy/credentials/openbao"
 	"github.com/laenenai/tenancy/internal/domain"
 	"github.com/laenenai/tenancy/internal/pg"
 	"github.com/laenenai/tenancy/tenancytest"
@@ -144,5 +146,127 @@ func TestRedactedRenderingsStillSayWhatTheyAre(t *testing.T) {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("Pool.String() = %q, want it to contain %q", rendered, want)
 		}
+	}
+}
+
+// canaryPassword stands in for an issued database password: a sentinel no
+// other part of this module produces, long enough that a match cannot be a
+// coincidence.
+const canaryPassword = "CANARY-PASSWORD-8a3f21d0"
+
+// canaryIssuerMark stands in for the bearer string a credential source
+// authenticates to its own issuer with. It is named for the sentinel it is
+// rather than for what it stands in for, because gosec's G101 flags a literal
+// whose *name* says credential — correctly, everywhere except the one file
+// whose job is to prove such a literal never renders.
+const canaryIssuerMark = "CANARY-TOKEN-4b7e90ca"
+
+// TestNoTenancyTypeRendersAnIssuedCredential is the DSN convention applied to
+// the material a credential source deals in, which is new surface and the
+// same class of secret: an issued password is a database password, and the
+// token a source holds is a capability to mint more of them.
+//
+// Both are more exposed than a DSN rather than less. An issued credential is
+// constructed on the resolution path, so it is in scope in every error a
+// failed resolution can produce; and a Config holding the token is the value
+// a deployment logs at startup.
+func TestNoTenancyTypeRendersAnIssuedCredential(t *testing.T) {
+	t.Parallel()
+
+	// The instants are fixed rather than taken from the clock, and that is
+	// not tidiness: NoSecretLeaksInAnyRendering treats the material's length
+	// in decimal as a leak, because knowing a password is 6 characters
+	// rather than 64 removes most of a search space — and a time of day is
+	// a run of two-digit numbers with non-alphanumeric separators, so a
+	// wall-clock timestamp in the value under test makes this subtest fail
+	// at 14:43 for a 43-byte secret and pass at 14:44. Pinning the instants
+	// is what makes the assertion about the value.
+	cred := tenancy.Credential{
+		Username:  "v-token-app-role-1792727407",
+		Password:  canaryPassword,
+		LeaseID:   "database/creds/app/wBdUbo7iBqD0W6KmM8IuYrXh",
+		IssuedAt:  time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC),
+		ExpiresAt: time.Date(2026, 10, 23, 13, 0, 0, 0, time.UTC),
+	}
+
+	t.Run("Credential", func(t *testing.T) {
+		t.Parallel()
+		tenancytest.NoSecretLeaksInAnyRendering(t, cred, []byte(canaryPassword))
+	})
+
+	// The lease id is material too, and for a reason worth stating: it is
+	// not a secret in the sense of being hard to guess, it is a capability
+	// — whoever holds it can revoke the credential out from under every
+	// pool using it.
+	t.Run("CredentialLeaseID", func(t *testing.T) {
+		t.Parallel()
+		tenancytest.NoSecretLeaksInAnyRendering(t, cred, []byte(cred.LeaseID))
+	})
+
+	t.Run("OpenBaoConfig", func(t *testing.T) {
+		t.Parallel()
+		tenancytest.NoSecretLeaksInAnyRendering(t, openbao.Config{
+			Address:   "https://openbao.invalid:8200",
+			Token:     canaryIssuerMark,
+			MountPath: "database",
+			Role:      "app",
+		}, []byte(canaryIssuerMark))
+	})
+
+	t.Run("OpenBaoCredentials", func(t *testing.T) {
+		t.Parallel()
+		source, err := openbao.Open(context.Background(), openbao.Config{
+			Address: "https://openbao.invalid:8200",
+			Token:   canaryIssuerMark,
+			Role:    "app",
+		})
+		if err != nil {
+			t.Fatalf("openbao.Open: %v", err)
+		}
+		// A *Credentials holds the token in an unexported field, which is
+		// the shape fmt renders most dangerously: a value reached through
+		// one fails reflect.Value.CanInterface, so fmt abandons the method
+		// path for the whole subtree and prints it by raw reflection.
+		tenancytest.NoSecretLeaksInAnyRendering(t, source, []byte(canaryIssuerMark))
+	})
+}
+
+// TestIssuedCredentialRenderingStillSaysWhatItIs is the other half of the
+// convention: a placeholder that identifies nothing is a log line an operator
+// cannot act on.
+//
+// The username is deliberately NOT redacted, and that is a decision rather
+// than an omission. For a dynamically issued credential it is the ephemeral
+// role name Postgres knows the session by, it is visible to every session in
+// the cluster through pg_stat_activity, and it is the only identifier that
+// ties one of this module's log lines to a Postgres server log line and to
+// the issuer's own audit entry. The same goes for the validity window: a pool
+// retired too early or too late is diagnosed from exactly those two instants.
+func TestIssuedCredentialRenderingStillSaysWhatItIs(t *testing.T) {
+	t.Parallel()
+
+	cred := tenancy.Credential{
+		Username:  "v-token-app-role-1792727407",
+		Password:  canaryPassword,
+		LeaseID:   "database/creds/app/wBdUbo7iBqD0W6KmM8IuYrXh",
+		IssuedAt:  time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC),
+		ExpiresAt: time.Date(2026, 10, 23, 13, 0, 0, 0, time.UTC),
+	}
+	rendered := cred.String()
+	for _, want := range []string{
+		"tenancy.Credential", "v-token-app-role-1792727407",
+		"2026-10-23T12:00:00Z", "2026-10-23T13:00:00Z", domain.Redacted,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("Credential.String() = %q, want it to contain %q", rendered, want)
+		}
+	}
+
+	// A credential that does not expire renders its window as "never"
+	// rather than as Go's zero date, because no retirement for credential
+	// age is the normal, default case and that is what an operator needs to
+	// read there.
+	if got := (tenancy.Credential{}).String(); !strings.Contains(got, "never") {
+		t.Errorf("the zero Credential renders as %q, want it to say its expiry is \"never\"", got)
 	}
 }
