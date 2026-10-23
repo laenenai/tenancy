@@ -1,0 +1,114 @@
+
+================ database role: q2-inrole ================
+issued user=v-token-q2-inrol-hXNKYSeZvR5dYecg374a-1792728165 lease_ttl=600s
+-- identity --
+  current_user                                   v-token-q2-inrol-hXNKYSeZvR5dYecg374a-1792728165
+  session_user                                   v-token-q2-inrol-hXNKYSeZvR5dYecg374a-1792728165
+  current_setting('role')                        none
+  rolinherit                                     true
+  rolbypassrls                                   false
+  rolsuper                                       false
+  pg_has_role(current_user,'app_role','USAGE')   true
+  pg_has_role(current_user,'app_role','MEMBER')  true
+  has_table_privilege SELECT items               true
+  has_table_privilege INSERT items               true
+  has_table_privilege UPDATE items               false
+  has_table_privilege DELETE items               false
+  has_table_privilege TRUNCATE items             false
+  row_security_active('items')                   true
+-- RLS enforcement --
+  tenant=(unset)      SELECT count(*) -> 0 rows visible
+  tenant=tenant-a     SELECT count(*) -> 3 rows visible
+  tenant=tenant-b     SELECT count(*) -> 1 rows visible
+  tenant=' OR true -- SELECT count(*) -> 0 rows visible
+-- writes --
+  INSERT matching tenant (expect OK)             OK (INSERT 0 1)
+  INSERT other tenant (expect WITH CHECK violation) DENIED ERROR: new row violates row-level security policy for table "items" (SQLSTATE 42501)
+  UPDATE (expect privilege denied)               DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  DELETE (expect privilege denied)               DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  TRUNCATE (expect privilege denied)             DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  DDL: CREATE TABLE (expect denied)              DENIED ERROR: permission denied for schema public (SQLSTATE 42501)
+  SET ROLE app_role                              OK (SET)
+  after SET ROLE: current_user                   app_role
+  after SET ROLE: session_user                   v-token-q2-inrol-hXNKYSeZvR5dYecg374a-1792728165
+  RESET ROLE                                     OK (RESET)
+  after RESET ROLE: current_user                 v-token-q2-inrol-hXNKYSeZvR5dYecg374a-1792728165
+-- privileges granted to app_role AFTER this user existed --
+  has_table_privilege on the new table           true
+  SELECT from the new table                      OK (SELECT 1)
+
+================ database role: q2-grant ================
+issued user=v-token-q2-grant-qRw9pV5k4Qn05rGoq3oR-1792728165 lease_ttl=600s
+-- identity --
+  current_user                                   v-token-q2-grant-qRw9pV5k4Qn05rGoq3oR-1792728165
+  session_user                                   v-token-q2-grant-qRw9pV5k4Qn05rGoq3oR-1792728165
+  current_setting('role')                        none
+  rolinherit                                     true
+  rolbypassrls                                   false
+  rolsuper                                       false
+  pg_has_role(current_user,'app_role','USAGE')   true
+  pg_has_role(current_user,'app_role','MEMBER')  true
+  has_table_privilege SELECT items               true
+  has_table_privilege INSERT items               true
+  has_table_privilege UPDATE items               false
+  has_table_privilege DELETE items               false
+  has_table_privilege TRUNCATE items             false
+  row_security_active('items')                   true
+-- RLS enforcement --
+  tenant=(unset)      SELECT count(*) -> 0 rows visible
+  tenant=tenant-a     SELECT count(*) -> 4 rows visible
+  tenant=tenant-b     SELECT count(*) -> 1 rows visible
+  tenant=' OR true -- SELECT count(*) -> 0 rows visible
+-- writes --
+  INSERT matching tenant (expect OK)             OK (INSERT 0 1)
+  INSERT other tenant (expect WITH CHECK violation) DENIED ERROR: new row violates row-level security policy for table "items" (SQLSTATE 42501)
+  UPDATE (expect privilege denied)               DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  DELETE (expect privilege denied)               DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  TRUNCATE (expect privilege denied)             DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  DDL: CREATE TABLE (expect denied)              DENIED ERROR: permission denied for schema public (SQLSTATE 42501)
+  SET ROLE app_role                              OK (SET)
+  after SET ROLE: current_user                   app_role
+  after SET ROLE: session_user                   v-token-q2-grant-qRw9pV5k4Qn05rGoq3oR-1792728165
+  RESET ROLE                                     OK (RESET)
+  after RESET ROLE: current_user                 v-token-q2-grant-qRw9pV5k4Qn05rGoq3oR-1792728165
+-- privileges granted to app_role AFTER this user existed --
+  has_table_privilege on the new table           true
+  SELECT from the new table                      OK (SELECT 1)
+
+================ database role: q2-noinherit ================
+issued user=v-token-q2-noinh-LjR9HgfHWJg2fG2wOyQr-1792728165 lease_ttl=600s
+-- identity --
+  current_user                                   v-token-q2-noinh-LjR9HgfHWJg2fG2wOyQr-1792728165
+  session_user                                   v-token-q2-noinh-LjR9HgfHWJg2fG2wOyQr-1792728165
+  current_setting('role')                        none
+  rolinherit                                     false
+  rolbypassrls                                   false
+  rolsuper                                       false
+  pg_has_role(current_user,'app_role','USAGE')   false
+  pg_has_role(current_user,'app_role','MEMBER')  true
+  has_table_privilege SELECT items               false
+  has_table_privilege INSERT items               false
+  has_table_privilege UPDATE items               false
+  has_table_privilege DELETE items               false
+  has_table_privilege TRUNCATE items             false
+  row_security_active('items')                   true
+-- RLS enforcement --
+  tenant=(unset)      SELECT count(*) -> ERROR ERROR: permission denied for table items (SQLSTATE 42501)
+  tenant=tenant-a     SELECT count(*) -> ERROR ERROR: permission denied for table items (SQLSTATE 42501)
+  tenant=tenant-b     SELECT count(*) -> ERROR ERROR: permission denied for table items (SQLSTATE 42501)
+  tenant=' OR true -- SELECT count(*) -> ERROR ERROR: permission denied for table items (SQLSTATE 42501)
+-- writes --
+  INSERT matching tenant (expect OK)             DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  INSERT other tenant (expect WITH CHECK violation) DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  UPDATE (expect privilege denied)               DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  DELETE (expect privilege denied)               DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  TRUNCATE (expect privilege denied)             DENIED ERROR: permission denied for table items (SQLSTATE 42501)
+  DDL: CREATE TABLE (expect denied)              DENIED ERROR: permission denied for schema public (SQLSTATE 42501)
+  SET ROLE app_role                              OK (SET)
+  after SET ROLE: current_user                   app_role
+  after SET ROLE: session_user                   v-token-q2-noinh-LjR9HgfHWJg2fG2wOyQr-1792728165
+  RESET ROLE                                     OK (RESET)
+  after RESET ROLE: current_user                 v-token-q2-noinh-LjR9HgfHWJg2fG2wOyQr-1792728165
+-- privileges granted to app_role AFTER this user existed --
+  has_table_privilege on the new table           false
+  SELECT from the new table                      DENIED ERROR: permission denied for table late_1792728166018354000 (SQLSTATE 42501)

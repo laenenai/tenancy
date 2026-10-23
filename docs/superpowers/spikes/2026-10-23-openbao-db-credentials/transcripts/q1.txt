@@ -1,0 +1,104 @@
+
+================ scenario: idle ================
+[t+  0.03s] role=q1-short issued user=v-token-q1-short-eUugoZVvnL0GU49oHHuh-1792727837 lease=database/creds/q1-short/wXsm6WtqSbiFnx2ACaMlqFbO ttl=10s renewable=true
+[t+  0.04s] pg_roles.rolvaliduntil=2026-10-23T03:57:32Z (14s from now)
+[t+  0.05s] connected, backend pid=102
+[t+  2.07s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+  4.09s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+  6.11s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+  8.11s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+ 10.11s] LEASE GONE from OpenBao: PUT sys/leases/lookup: HTTP 400: {"errors":["invalid lease"]}
+[t+ 10.12s] ROLE DROPPED in Postgres (pg_roles no longer has v-token-q1-short-eUugoZVvnL0GU49oHHuh-1792727837)
+[t+ 10.12s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 12.12s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 14.13s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 16.13s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 18.14s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 20.15s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 20.15s] NEW login with the same credential REFUSED: failed to connect to `user=v-token-q1-short-eUugoZVvnL0GU49oHHuh-1792727837 database=spike`: [::1]:55432 (localhost): failed SASL auth: FATAL: password authentication failed for user "v-token-q1-short-eUugoZVvnL0GU49oHHu...
+--- summary(idle): first open-connection failure: t+10.12s ERROR: permission denied for table items (SQLSTATE 42501) ---
+
+================ scenario: txn ================
+[t+  0.01s] role=q1-short issued user=v-token-q1-short-HcVt4jiaFegjhZ0VcO98-1792727857 lease=database/creds/q1-short/2FR8zPnuaP6DtsXV6WNzLOLe ttl=10s renewable=true
+[t+  0.03s] pg_roles.rolvaliduntil=2026-10-23T03:57:52Z (14s from now)
+[t+  0.04s] connected, backend pid=106
+[t+  0.04s] transaction open, first read saw 0 rows
+[t+  2.06s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+  4.10s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+  6.11s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+  8.12s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+ 10.13s] LEASE GONE from OpenBao: PUT sys/leases/lookup: HTTP 400: {"errors":["invalid lease"]}
+[t+ 10.13s] ROLE DROPPED in Postgres (pg_roles no longer has v-token-q1-short-HcVt4jiaFegjhZ0VcO98-1792727857)
+[t+ 10.13s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 12.15s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 14.15s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 16.17s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 18.17s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 20.17s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 20.18s] NEW login with the same credential REFUSED: failed to connect to `user=v-token-q1-short-HcVt4jiaFegjhZ0VcO98-1792727857 database=spike`: [::1]:55432 (localhost): failed SASL auth: FATAL: password authentication failed for user "v-token-q1-short-HcVt4jiaFegjhZ0VcO9...
+[t+ 20.18s] COMMIT succeeded
+--- summary(txn): first open-connection failure: NONE — it never failed ---
+
+================ scenario: txn-untouched ================
+[t+  0.01s] role=q1-short issued user=v-token-q1-short-HRloi5EZ5WjQi9RwmTqb-1792727877 lease=database/creds/q1-short/527jFFefSJntkLrZn7WN4ezP ttl=10s renewable=true
+[t+  0.02s] pg_roles.rolvaliduntil=2026-10-23T03:58:12Z (14s from now)
+[t+  0.03s] connected, backend pid=109
+[t+  0.03s] transaction open, items NOT yet touched (no lock held on it)
+[t+  2.06s] (holding off the first probe so no lock is taken on items yet)
+[t+  4.08s] (holding off the first probe so no lock is taken on items yet)
+[t+  6.09s] (holding off the first probe so no lock is taken on items yet)
+[t+  8.10s] (holding off the first probe so no lock is taken on items yet)
+[t+ 10.11s] LEASE GONE from OpenBao: PUT sys/leases/lookup: HTTP 400: {"errors":["invalid lease"]}
+[t+ 10.11s] ROLE DROPPED in Postgres (pg_roles no longer has v-token-q1-short-HRloi5EZ5WjQi9RwmTqb-1792727877)
+[t+ 10.11s] (holding off the first probe so no lock is taken on items yet)
+[t+ 12.11s] (holding off the first probe so no lock is taken on items yet)
+[t+ 14.13s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 16.13s] probe=FAIL: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 18.14s] probe=FAIL: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 20.14s] probe=FAIL: ERROR: current transaction is aborted, commands ignored until end of transaction block (SQLSTATE 25P02) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 20.15s] NEW login with the same credential REFUSED: failed to connect to `user=v-token-q1-short-HRloi5EZ5WjQi9RwmTqb-1792727877 database=spike`: [::1]:55432 (localhost): failed SASL auth: FATAL: password authentication failed for user "v-token-q1-short-HRloi5EZ5WjQi9RwmTq...
+[t+ 20.15s] COMMIT failed: commit unexpectedly resulted in rollback
+--- summary(txn-untouched): first open-connection failure: t+14.13s ERROR: permission denied for table items (SQLSTATE 42501) ---
+
+================ scenario: prepared ================
+[t+  0.01s] role=q1-short issued user=v-token-q1-short-04uwpOIIjIdIV7oWbFFl-1792727897 lease=database/creds/q1-short/G6pLL0eQZhthKwkzFKmdXZuw ttl=10s renewable=true
+[t+  0.02s] pg_roles.rolvaliduntil=2026-10-23T03:58:32Z (14s from now)
+[t+  0.04s] connected, backend pid=113
+[t+  0.04s] named prepared statement q1_count created
+[t+  2.05s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+  4.06s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+  6.06s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+  8.07s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+ 10.07s] LEASE GONE from OpenBao: PUT sys/leases/lookup: HTTP 400: {"errors":["invalid lease"]}
+[t+ 10.07s] ROLE DROPPED in Postgres (pg_roles no longer has v-token-q1-short-04uwpOIIjIdIV7oWbFFl-1792727897)
+[t+ 10.07s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 12.10s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 14.10s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 16.11s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 18.11s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 20.12s] probe=FAIL: ERROR: permission denied for table items (SQLSTATE 42501) conn.IsClosed=false lease_known=false role_exists=false
+[t+ 20.13s] NEW login with the same credential REFUSED: failed to connect to `user=v-token-q1-short-04uwpOIIjIdIV7oWbFFl-1792727897 database=spike`: [::1]:55432 (localhost): failed SASL auth: FATAL: password authentication failed for user "v-token-q1-short-04uwpOIIjIdIV7oWbFF...
+--- summary(prepared): first open-connection failure: t+10.07s ERROR: permission denied for table items (SQLSTATE 42501) ---
+
+================ scenario: locked ================
+[t+  0.01s] role=q1-short-inrole issued user=v-token-q1-short-PgEKm3totkqkBSA8Lz5s-1792727918 lease=database/creds/q1-short-inrole/dyv2Jd6nOeThRhx4ONOesW8P ttl=10s renewable=true
+[t+  0.02s] pg_roles.rolvaliduntil=2026-10-23T03:58:53Z (15s from now)
+[t+  0.03s] connected, backend pid=117
+[t+  0.04s] transaction holds RowExclusiveLock on items (uncommitted INSERT)
+[t+  2.06s] probe=OK conn.IsClosed=false lease_known=true role_exists=true
+[t+  4.06s] calling sys/leases/revoke ...
+[t+  4.09s] revoke returned after 0.03s err=<nil>
+[t+  4.10s] LEASE GONE from OpenBao: PUT sys/leases/lookup: HTTP 400: {"errors":["invalid lease"]}
+[t+  4.10s] ROLE DROPPED in Postgres (pg_roles no longer has v-token-q1-short-PgEKm3totkqkBSA8Lz5s-1792727918)
+[t+  4.10s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+  6.11s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+  8.11s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 10.11s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 12.13s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 14.13s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 16.14s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 18.14s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 20.15s] probe=OK conn.IsClosed=false lease_known=false role_exists=false
+[t+ 20.16s] NEW login with the same credential REFUSED: failed to connect to `user=v-token-q1-short-PgEKm3totkqkBSA8Lz5s-1792727918 database=spike`: [::1]:55432 (localhost): failed SASL auth: FATAL: password authentication failed for user "v-token-q1-short-PgEKm3totkqkBSA8Lz5...
+[t+ 20.16s] COMMIT succeeded
+--- summary(locked): first open-connection failure: NONE — it never failed ---

@@ -1,0 +1,20 @@
+[t+  0.01s] static-creds BEFORE: user=app_runtime lease_duration=0 data={"last_vault_rotation":"2026-10-23T03:57:07.271889384Z","password":"ega2Pkg3BchnsjZGOkt-","rotation_period":600,"ttl":261,"username":"app_runtime"}
+[t+  0.05s] pool warmed: 4 idle connections, backend pids=[141 142 143 144] stat=stat{total=4 idle=4 acquired=0 new=4}
+[t+  0.05s] POST database/rotate-role/app-runtime ...
+[t+  0.06s] rotate-role returned after 0.009s err=<nil>
+[t+  0.06s] static-creds AFTER: user=app_runtime password_changed=true data={"last_vault_rotation":"2026-10-23T04:02:46.735475597Z","password":"aoLqSMs4tkbVaScs-J1t","rotation_period":600,"ttl":600,"username":"app_runtime"}
+[t+  0.07s] pooled: 4/4 ok pids=[141 143 142 144] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=5}
+[t+  3.09s] pooled: 4/4 ok pids=[144 141 143 142] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=6}
+[t+  6.11s] pooled: 4/4 ok pids=[142 143 141 144] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=7}
+[t+  9.12s] pooled: 4/4 ok pids=[141 144 143 142] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=8}
+[t+ 12.15s] pooled: 4/4 ok pids=[142 144 141 143] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=9}
+[t+ 15.16s] pooled: 4/4 ok pids=[144 142 143 141] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=10}
+[t+ 18.19s] pooled: 4/4 ok pids=[143 142 144 141] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=11}
+[t+ 21.23s] pooled: 4/4 ok pids=[143 141 144 142] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=12}
+[t+ 24.24s] pooled: 4/4 ok pids=[142 143 144 141] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=13}
+[t+ 27.25s] pool.Ping (may reuse an existing connection) -> <nil>
+
+--- summary ---
+existing pooled connections, first failure: NONE in the watch window
+new connections, first failure:             t+0.07s SQLSTATE 28P01: password authentication failed for user "app_runtime"
+a new connection ever succeeded after rotation: false
