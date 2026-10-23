@@ -1,0 +1,497 @@
+# Public API of github.com/laenenai/tenancy, as a golden file.
+#
+# Regenerate with: go test . -run TestAPIGolden -update-api
+#
+# "package tenancy" is the facade a consumer imports; "package tenancytest"
+# is the conformance suite it runs against its own wiring; "package testdb"
+# is the shared container harness other modules import. The internal
+# packages are listed too, because the facade re-exports their types as
+# aliases: a change to one of those signatures changes what a consumer
+# sees, even though the import path itself is private. Growing this file is
+# a reviewed diff — see CHARTER.md.
+
+package tenancy // .
+
+type Applied = migrate.Applied
+
+func AssertRLSCoverage(ctx context.Context, db DDL, schema string) ([]string, error)
+
+type CacheOptions = pool.Options
+
+func CanonicalTime(t time.Time) time.Time
+
+type Clock = domain.Clock
+
+type Config = scope.Config
+
+type Control = registry.Control
+
+type DDL = pg.DDL
+
+const DefaultMaxTenants = pool.DefaultMaxTenants
+
+func EnableRLS(ctx context.Context, db DDL, tables ...string) error
+
+type Enforcement = pg.Enforcement
+
+var ErrConflict = domain.ErrConflict
+
+var ErrInvalidConfig = domain.ErrInvalidConfig
+
+var ErrMalformedID = domain.ErrMalformedID
+
+var ErrNoTenantScope = domain.ErrNoTenantScope
+
+var ErrNotAuthorizedOrNotFound = domain.ErrNotAuthorizedOrNotFound
+
+var ErrUnavailable = domain.ErrUnavailable
+
+type FixedClock = domain.FixedClock
+
+func IsRLSViolation(err error) bool
+
+func Migrate(ctx context.Context, cfg MigrateConfig) error
+
+type MigrateConfig = migrate.Config
+
+const MigrationIdentity = migrate.Identity
+
+func MigrationLockKey() int64
+
+func MigrationStatus(ctx context.Context, cfg MigrateConfig) ([]Applied, error)
+
+func NewFixedClock(t time.Time) *FixedClock
+
+type NewPool = registry.NewPool
+
+func NewPoolID(clock Clock) PoolID
+
+type NewTenant = registry.NewTenant
+
+func NewTenantID(clock Clock) TenantID
+
+func Open(ctx context.Context, cfg Config) (*Tenancy, error)
+
+type Opener = pool.Opener
+
+func ParsePoolID(s string) (PoolID, error)
+
+func ParseTenantID(s string) (TenantID, error)
+
+type Pool = domain.Pool
+
+type PoolConfig = pg.PoolConfig
+
+type PoolID = domain.PoolID
+
+const RLSViolationCode = pg.RLSViolationCode
+
+type Readiness = domain.Readiness
+
+const ReadinessErased = domain.ReadinessErased
+
+const ReadinessPending = domain.ReadinessPending
+
+const ReadinessQuarantined = domain.ReadinessQuarantined
+
+const ReadinessReady = domain.ReadinessReady
+
+var RegistryTablesExemptFromRLS = pg.RegistryTablesExemptFromRLS
+
+const Schema = migrate.Schema
+
+type Scoped = pg.Scoped
+
+type SecurityMode = domain.SecurityMode
+
+const SecurityModeManaged = domain.SecurityModeManaged
+
+const SecurityModeTenantKey = domain.SecurityModeTenantKey
+
+const SecurityModeVault = domain.SecurityModeVault
+
+type SystemClock = domain.SystemClock
+
+type TableEnforcement = pg.TableEnforcement
+
+type Tenancy = scope.Tenancy
+
+type Tenant = domain.Tenant
+
+const TenantGUC = pg.TenantGUC
+
+type TenantID = domain.TenantID
+
+const TenantPolicyName = pg.TenantPolicyName
+
+const TenantPredicate = pg.TenantPredicate
+
+type TenantStatus = domain.TenantStatus
+
+const TenantStatusActive = domain.TenantStatusActive
+
+const TenantStatusDeleting = domain.TenantStatusDeleting
+
+const TenantStatusSuspended = domain.TenantStatusSuspended
+
+type TenantTx = pg.TenantTx
+
+package tenancytest // tenancytest
+
+type Deployment struct {
+	MigrationDSN string
+	RuntimeDSN string
+	AppRole string
+}
+
+func RunTenancySuite(t *testing.T, newDeployment func(t *testing.T) Deployment)
+
+package testdb // testdb
+
+const AppRole = "tenancy_app_test"
+
+type DB struct {
+	// has unexported fields
+}
+
+func (*DB) DSN() string
+
+func (*DB) Name() string
+
+func (*DB) Pool() *pgxpool.Pool
+
+type Migrator func(ctx context.Context, dsn string) error
+
+func NoMigrations(context.Context, string) error
+
+type Option func(*options)
+
+const PostgresImage = "pgvector/pgvector:pg18"
+
+func Start(t *testing.T, opts ...Option) *DB
+
+func WithMigrator(m Migrator) Option
+
+package domain // internal/domain
+
+func CanonicalTime(t time.Time) time.Time
+
+type Clock interface {
+	Now() time.Time
+}
+
+var ErrConflict = errors.New("tenancy: conflict")
+
+var ErrInvalidConfig = errors.New("tenancy: invalid config")
+
+var ErrMalformedID = errors.New("malformed id")
+
+var ErrNoTenantScope = errors.New("tenancy: no tenant scope")
+
+var ErrNotAuthorizedOrNotFound = errors.New("tenancy: not authorized or not found")
+
+var ErrUnavailable = errors.New("tenancy: unavailable")
+
+type FixedClock struct {
+	// has unexported fields
+}
+
+func (*FixedClock) Advance(d time.Duration)
+
+func (*FixedClock) Now() time.Time
+
+func NewFixedClock(t time.Time) *FixedClock
+
+func NewPoolID(clock Clock) PoolID
+
+func NewTenantID(clock Clock) TenantID
+
+func ParsePoolID(s string) (PoolID, error)
+
+func ParseTenantID(s string) (TenantID, error)
+
+type Pool struct {
+	ID PoolID
+	Name string
+	Region string
+	MetadataDSN string
+	BlobConfigRef string
+	WorkerCapacity int
+	CreatedAt time.Time
+}
+
+type PoolID string
+
+type Readiness string
+
+func (Readiness) Valid() bool
+
+const ReadinessErased Readiness = "erased"
+
+const ReadinessPending Readiness = "pending"
+
+const ReadinessQuarantined Readiness = "quarantined"
+
+const ReadinessReady Readiness = "ready"
+
+type SecurityMode string
+
+func (SecurityMode) Valid() bool
+
+const SecurityModeManaged SecurityMode = "managed"
+
+const SecurityModeTenantKey SecurityMode = "tenant-key"
+
+const SecurityModeVault SecurityMode = "vault"
+
+type SystemClock struct{}
+
+func (SystemClock) Now() time.Time
+
+type Tenant struct {
+	ID TenantID
+	PoolID PoolID
+	Name string
+	SecurityMode SecurityMode
+	Status TenantStatus
+	CreatedAt time.Time
+}
+
+type TenantID string
+
+type TenantStatus string
+
+func (TenantStatus) Valid() bool
+
+const TenantStatusActive TenantStatus = "active"
+
+const TenantStatusDeleting TenantStatus = "deleting"
+
+const TenantStatusSuspended TenantStatus = "suspended"
+
+package migrate // internal/migrate
+
+type Applied = pgmigrate.Applied
+
+type Config struct {
+	DSN string
+	AppRole string
+	Postgres pg.PoolConfig
+}
+
+const Identity = "github.com/laenenai/tenancy/internal/migrate"
+
+func LockKey() int64
+
+const Schema = "tenancy"
+
+func Status(ctx context.Context, cfg Config) ([]Applied, error)
+
+func Up(ctx context.Context, cfg Config) error
+
+package pg // internal/pg
+
+func AssertRLSCoverage(ctx context.Context, db DDL, schema string) ([]string, error)
+
+type DDL interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+func EnableRLS(ctx context.Context, db DDL, tables ...string) error
+
+type Enforcement struct {
+	Role string
+	Superuser bool
+	BypassRLS bool
+	Tables []TableEnforcement
+	ResidualTenantContext string
+}
+
+func (Enforcement) FailClosed() bool
+
+func (Enforcement) Findings() []string
+
+func IsRLSViolation(err error) bool
+
+func NewScoped(tenant domain.Tenant, poolRow domain.Pool, db *pgxpool.Pool, appRole string) Scoped
+
+func Open(ctx context.Context, dsn string, cfg PoolConfig) (*pgxpool.Pool, error)
+
+type PoolConfig struct {
+	MaxConns int32
+	MinConns int32
+	MaxConnLifetime time.Duration
+	MaxConnIdleTime time.Duration
+	ConnectTimeout time.Duration
+	ApplicationName string
+	Tracer pgx.QueryTracer
+	AfterConnect func(ctx context.Context, conn *pgx.Conn) error
+}
+
+const RLSViolationCode = "42501"
+
+var RegistryTablesExemptFromRLS = map[string]string{
+	"tenancy.pools": "resolution reads tenancy.pools and tenancy.tenants before any tenant " +
+		"session context exists — a policy keyed on " + TenantGUC + " would stop the resolver " +
+		"reading the very row that establishes that context; see db/migrations/00001_registry.sql",
+	"tenancy.tenants": "resolution reads tenancy.pools and tenancy.tenants before any tenant " +
+		"session context exists — a policy keyed on " + TenantGUC + " would stop the resolver " +
+		"reading the very row that establishes that context; see db/migrations/00001_registry.sql",
+}
+
+type Scoped struct {
+	// has unexported fields
+}
+
+func (Scoped) AppRole() string
+
+func (Scoped) CheckEnforcement(ctx context.Context, tables ...string) (Enforcement, error)
+
+func (Scoped) Pool() domain.Pool
+
+func (Scoped) Tenant() domain.Tenant
+
+func (Scoped) Tx(ctx context.Context, fn func(ctx context.Context, tx TenantTx) error) error
+
+func (Scoped) Valid() bool
+
+type TableEnforcement struct {
+	Table string
+	Exists bool
+	RowSecurityEnabled bool
+	RowSecurityForced bool
+	PolicyPresent bool
+	OwnedByRole bool
+}
+
+const TenantGUC = "app.tenant_id"
+
+const TenantPolicyName = "tenant_isolation"
+
+const TenantPredicate = "tenant_id = nullif(current_setting('" + TenantGUC + "', true), '')"
+
+type TenantTx struct {
+	// has unexported fields
+}
+
+func (TenantTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+
+func (TenantTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+
+func (TenantTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+
+func (TenantTx) Tenant() domain.TenantID
+
+package pool // internal/pool
+
+type CachingResolver struct {
+	// has unexported fields
+}
+
+func (*CachingResolver) Close() error
+
+func (*CachingResolver) Resolve(ctx context.Context, id domain.TenantID) (Handle, error)
+
+const DefaultMaxTenants = 10_000
+
+type Handle struct {
+	Pool domain.Pool
+	Tenant domain.Tenant
+	DB *pgxpool.Pool
+}
+
+func NewOpener(cfg pg.PoolConfig) Opener
+
+func NewResolver(registry Registry, open Opener, opts Options) *CachingResolver
+
+type Opener func(ctx context.Context, p domain.Pool) (*pgxpool.Pool, error)
+
+type Options struct {
+	TTL time.Duration
+	NegativeTTL time.Duration
+	MaxPools int
+	MaxTenants int
+	Clock domain.Clock
+}
+
+type Registry interface {
+	TenantByID(ctx context.Context, id domain.TenantID) (domain.Tenant, error)
+	PoolByID(ctx context.Context, id domain.PoolID) (domain.Pool, error)
+}
+
+type Resolver interface {
+	Resolve(ctx context.Context, id domain.TenantID) (Handle, error)
+}
+
+package registry // internal/registry
+
+type Config struct {
+	DSN string
+	Postgres pg.PoolConfig
+	Clock domain.Clock
+}
+
+type Control struct {
+	// has unexported fields
+}
+
+func (*Control) Close()
+
+func (*Control) CreatePool(ctx context.Context, in NewPool) (domain.Pool, error)
+
+func (*Control) CreateTenant(ctx context.Context, in NewTenant) (domain.Tenant, error)
+
+func (*Control) PoolByID(ctx context.Context, id domain.PoolID) (domain.Pool, error)
+
+func (*Control) PoolByName(ctx context.Context, name string) (domain.Pool, error)
+
+func (*Control) SetTenantStatus(ctx context.Context, id domain.TenantID, status domain.TenantStatus) (domain.Tenant, error)
+
+func (*Control) TenantByID(ctx context.Context, id domain.TenantID) (domain.Tenant, error)
+
+func (*Control) TenantByName(ctx context.Context, name string) (domain.Tenant, error)
+
+type NewPool struct {
+	ID domain.PoolID
+	Name string
+	Region string
+	MetadataDSN string
+	BlobConfigRef string
+	WorkerCapacity int
+}
+
+type NewTenant struct {
+	ID domain.TenantID
+	PoolID domain.PoolID
+	Name string
+	SecurityMode domain.SecurityMode
+	Status domain.TenantStatus
+}
+
+func Open(ctx context.Context, cfg Config) (*Control, error)
+
+package scope // internal/scope
+
+type Config struct {
+	RegistryDSN string
+	AppRole string
+	Postgres pg.PoolConfig
+	Cache pool.Options
+	Clock domain.Clock
+	Opener pool.Opener
+}
+
+func Open(ctx context.Context, cfg Config) (*Tenancy, error)
+
+type Tenancy struct {
+	// has unexported fields
+}
+
+func (*Tenancy) Close() error
+
+func (*Tenancy) Control() *registry.Control
+
+func (*Tenancy) Scope(ctx context.Context, id domain.TenantID) (pg.Scoped, error)
