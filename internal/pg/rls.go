@@ -17,6 +17,18 @@ import (
 // the convention rather than guess at it.
 const TenantPolicyName = "tenant_isolation"
 
+// TenantAccessPolicyName is the permissive companion to TenantPolicyName.
+//
+// It exists because TenantPolicyName is RESTRICTIVE, and a table whose only
+// policies are restrictive has an empty permissive set — which Postgres treats
+// as denying every row. This policy is deliberately `USING (true)`: it grants
+// nothing on its own, it exists so the tenant restriction has something to
+// AND against, and the tenant restriction is what actually filters.
+//
+// A consumer adding its own permissive policies ORs them with this one and
+// still cannot escape the AND. That is the whole point of the arrangement.
+const TenantAccessPolicyName = "tenant_access"
+
 // TenantPredicate is the single source of truth for this system's
 // row-level-security convention: every tenant-scoped table carries a
 // tenant_id column, and one policy using exactly this expression as both
@@ -136,8 +148,32 @@ func EnableRLS(ctx context.Context, db DDL, tables ...string) error {
 	return nil
 }
 
-// enableOne runs ENABLE, FORCE, DROP POLICY and CREATE POLICY for one
-// table inside a single transaction.
+// enableOne runs ENABLE, FORCE, and the two policies for one table inside a
+// single transaction.
+//
+// # Why there are two policies, and why the tenant one is RESTRICTIVE
+//
+// Postgres OR-s permissive policies together and AND-s restrictive ones on
+// top. A tenant predicate written as a single *permissive* policy — which is
+// what this module shipped first, and what cas and audit still carry — can
+// therefore be **OR-ed away by any additional permissive policy on the same
+// table**. Measured on Postgres 18.6: a tenant seeing its own single row saw
+// two the moment a second permissive policy existed, and the second row
+// belonged to another tenant. That is a cross-tenant disclosure created by
+// adding a policy, which any table owner can do and which no consumer would
+// expect to weaken isolation.
+//
+// So the tenant predicate is RESTRICTIVE, and a consumer may add as many
+// permissive policies as it likes: they OR among themselves and the tenant
+// restriction still AND-s over the result. A consumer can narrow within its
+// tenant and cannot widen past it.
+//
+// The permissive companion is required, not decorative: a table with only
+// restrictive policies has an empty permissive set, and Postgres then denies
+// every row. Verified both ways — restrictive alone returned 0 rows, the pair
+// returned exactly the tenant's own, an added permissive policy did not change
+// that, no tenant context still returned 0, and a cross-tenant INSERT was
+// still refused naming the tenant policy.
 //
 // The atomicity is not tidiness. Four unwrapped Exec calls could leave the
 // table FORCEd into row security with zero policies, and Postgres
@@ -152,12 +188,21 @@ func enableOne(ctx context.Context, db DDL, table, ident string) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	policy := pgx.Identifier{TenantPolicyName}.Sanitize()
+	access := pgx.Identifier{TenantAccessPolicyName}.Sanitize()
 	statements := []string{
 		"ALTER TABLE " + ident + " ENABLE ROW LEVEL SECURITY",
 		"ALTER TABLE " + ident + " FORCE ROW LEVEL SECURITY",
 		"DROP POLICY IF EXISTS " + policy + " ON " + ident,
-		"CREATE POLICY " + policy + " ON " + ident +
+		"DROP POLICY IF EXISTS " + access + " ON " + ident,
+		// The tenant predicate is RESTRICTIVE, so it is AND-ed with
+		// everything and cannot be OR-ed away. See the doc comment above.
+		"CREATE POLICY " + policy + " ON " + ident + " AS RESTRICTIVE" +
 			" USING (" + TenantPredicate + ") WITH CHECK (" + TenantPredicate + ")",
+		// A restrictive policy with no permissive policy to AND against
+		// denies every row, so the companion is required rather than
+		// decorative.
+		"CREATE POLICY " + access + " ON " + ident + " AS PERMISSIVE" +
+			" USING (true) WITH CHECK (true)",
 	}
 	for _, stmt := range statements {
 		if _, err := tx.Exec(ctx, stmt); err != nil {

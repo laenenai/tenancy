@@ -144,6 +144,7 @@ func RunTenancySuite(t *testing.T, newDeployment func(t *testing.T) Deployment) 
 	t.Run("RLSRefusesACrossTenantWrite", testRLSRefusesACrossTenantWrite(newDeployment))
 	t.Run("RLSIsForcedSoTheTableOwnerIsSubjectToIt", testRLSIsForced(newDeployment))
 	t.Run("RLSCoverageSweepReportsAMissingPolicy", testRLSCoverageSweep(newDeployment))
+	t.Run("RLSAnAddedPermissivePolicyCannotWiden", testRLSAddedPermissivePolicyCannotWiden(newDeployment))
 }
 
 // The fixture schema and the two tables the suite stands up. They live
@@ -1419,4 +1420,57 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// testRLSAddedPermissivePolicyCannotWiden is the regression test for a
+// cross-tenant disclosure this module shipped, found by an OpenBao spike.
+//
+// Postgres ORs permissive policies together and ANDs restrictive ones over the
+// result. A tenant predicate written as a single *permissive* policy is
+// therefore OR-able away by any additional permissive policy on the same
+// table. Measured on Postgres 18.6 against the arrangement this module first
+// shipped: a tenant seeing its own single row saw two the moment a second
+// permissive policy existed, and the second row belonged to another tenant.
+// Adding a policy weakened isolation, which no consumer would expect and which
+// any table owner could do.
+//
+// So the subtest adds exactly such a policy and requires the tenant to keep
+// seeing only its own rows. It fails against a permissive-only tenant policy
+// and passes against the restrictive-plus-companion arrangement.
+func testRLSAddedPermissivePolicyCannotWiden(newDeployment func(t *testing.T) Deployment) func(*testing.T) {
+	return func(t *testing.T) {
+		dep := newDeployment(t)
+		e := setup(t, dep, defaultCache(), dep.AppRole, 0)
+		ctx := context.Background()
+
+		scopedA := mustScope(ctx, t, e.tenancy, e.tenantA.ID)
+		requireFailClosed(ctx, t, scopedA)
+		seedRow(ctx, t, scopedA, "mine")
+
+		scopedB := mustScope(ctx, t, e.tenancy, e.tenantB.ID)
+		seedRow(ctx, t, scopedB, "not-mine")
+
+		// The policy the test exists to defeat. A consumer adding a
+		// reporting or admin view would write exactly this.
+		if _, err := e.admin.Exec(ctx,
+			"CREATE POLICY widen_attempt ON "+forcedTable+" AS PERMISSIVE USING (true)"); err != nil {
+			t.Fatalf("could not add the permissive policy this test exists to defeat: %v", err)
+		}
+
+		var count int
+		err := e.asRole(ctx, t, dep.AppRole, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, "SELECT set_config($1, $2, true)", tenancy.TenantGUC, string(e.tenantA.ID)); err != nil {
+				return err
+			}
+			return tx.QueryRow(ctx, "SELECT count(*) FROM "+forcedTable).Scan(&count)
+		})
+		if err != nil {
+			t.Fatalf("counting as tenant A: %v", err)
+		}
+		if count != 1 {
+			t.Fatalf("with one extra permissive policy present, tenant A sees %d rows, want 1.\n"+
+				"the tenant predicate was OR-ed away rather than AND-ed: it must be "+
+				"AS RESTRICTIVE, with a permissive companion for it to AND against", count)
+		}
+	}
 }
