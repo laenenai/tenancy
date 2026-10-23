@@ -191,8 +191,52 @@ the wrong reason.
   typed errors.
 - Adapters behind ports. The core performs no I/O and is unit-testable with
   in-memory adapters.
-- `sqlc` for queries; `goose` for migrations (decided in `tenancy`'s charter);
-  migrations embedded in the binary and applied by the library.
+- **`sqlc` for queries; `goose` for migrations** (decided in `tenancy`'s
+  charter); migrations embedded in the binary and applied by the library.
+
+### sqlc is the default, and the objection to it was a misreading
+
+Decided 2026-10-23, after `iam` and `audit` both hand-wrote their SQL.
+`iam` documented two reasons; one was a real constraint with a clean answer, and
+the other had it backwards.
+
+- **"The SQL is the load-bearing artifact and belongs where it is read and
+  reviewed rather than behind a generator."** This argues *for* sqlc, not
+  against it. sqlc does not hide SQL — it puts it in `db/queries/*.sql`, where a
+  reviewer reads it **as SQL**, with comments, syntax highlighting and a schema
+  checked against it at generation time. The alternative is the same statement
+  as a Go string literal inside a method, which is strictly less reviewable. A
+  reconciliation's insert-then-delete-what-is-absent is *more* visible in a
+  query file than inline.
+
+- **"Mapping an opaque domain type through sqlc needs codec methods on the type
+  whose point is having no reachable representation."** That constraint is real
+  and the answer is not codec methods. Two cases:
+
+  - **A named primitive type** (`TenantID string`, `KEKVersion uint32`) maps
+    directly in an sqlc override, as `cas/sqlc.yaml` already does for every id
+    column. Typed ids survive to the boundary and a generated layer never hands
+    back a bare string.
+  - **A deliberately opaque type** — a struct with an unexported field, so that
+    no package outside `internal/domain` can forge or convert one, as
+    `iam.ClearanceGroupID` is — maps to its **primitive**, and the adapter
+    converts through the validating parser (`ParseClearanceGroupID`) at its own
+    boundary. One conversion per field, and the invariant is untouched.
+
+  **Never give such a type `sql.Scanner` or `driver.Valuer`.** Those methods are
+  exported, so any package could then construct one from an arbitrary string —
+  which destroys exactly the unforgeability the type exists for. A storage
+  concern must not be solved by widening a security-relevant type's surface.
+
+**The one genuine exception: SQL composed at runtime.** `iam`'s `Predicate`
+returns a composable fragment for the consumer to embed in its own statement,
+so there is no fixed query to generate. Hand-compose it, state in the package
+doc that it is the exception and why, and keep its text in one place rather than
+assembled across methods.
+
+Anything else hand-written is a departure that needs a reason in the package
+doc — and "the SQL matters here" is not one, because that is the case sqlc
+serves best.
 
 ## Errors
 

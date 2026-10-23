@@ -43,6 +43,10 @@ description = "Full suite including container- and database-backed tests."
 env = { CGO_ENABLED = "1" }
 run = "go test ./... -race"
 
+[tasks.generate]
+description = "Regenerate sqlc query code. No-op until the module has a sqlc.yaml."
+run = "test -f sqlc.yaml && sqlc generate || echo 'no sqlc.yaml — nothing to generate'"
+
 [tasks.api]
 description = "Regenerate api.txt, the public-surface golden file the charter requires."
 # The golden file is checked by an ordinary test (api_test.go), which is why
