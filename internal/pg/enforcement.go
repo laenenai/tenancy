@@ -71,6 +71,21 @@ type Enforcement struct {
 	// otherwise.
 	Role string
 
+	// SessionRole is session_user: the role the connection itself
+	// authenticated as, which differs from Role whenever AppRole narrowed
+	// the transaction.
+	//
+	// It is reported because with a dynamically issued credential it is
+	// the only place the ephemeral role name appears, and that name is
+	// what ties a pg_stat_activity row, a Postgres log line and the
+	// issuer's own audit entry to each other. It constrains nothing by
+	// itself: a policy's TO clause is resolved against current_user, not
+	// against session_user, which is exactly why an ephemeral member of
+	// the application role is covered by a policy naming that role —
+	// measured, see
+	// docs/superpowers/spikes/2026-10-23-openbao-db-credentials.md.
+	SessionRole string
+
 	// Superuser and BypassRLS are the two role attributes that defeat row
 	// security outright. A superuser bypasses it unconditionally, FORCE or
 	// not; BYPASSRLS does the same by name. Either one true means nothing
@@ -102,6 +117,18 @@ type TableEnforcement struct {
 	Exists bool
 	// RowSecurityEnabled is pg_class.relrowsecurity.
 	RowSecurityEnabled bool
+	// RowSecurityActive is row_security_active on this table, read as the
+	// role that runs the statements. It is the authoritative answer, where
+	// every other field here is an input to it: Postgres reports whether
+	// this role's statements against this table are filtered by its
+	// policies right now, having already accounted for the role's
+	// attributes, the table's ownership and FORCE.
+	//
+	// It is the direct positive confirmation the spike recommends, and it
+	// is the field worth asserting from a dynamically issued credential:
+	// the credential's name does not appear in any policy, and this is how
+	// a deployment establishes that it is nonetheless covered by one.
+	RowSecurityActive bool
 	// RowSecurityForced is pg_class.relforcerowsecurity. Without it the
 	// table's owner is exempt from its own policy.
 	RowSecurityForced bool
@@ -154,15 +181,17 @@ func (s Scoped) CheckEnforcement(ctx context.Context, tables ...string) (Enforce
 // transaction. Reading the catalog as the application role rather than as
 // the connecting role is the point: ownership is relative to a role, so
 // "does the role that runs the statements own this table" cannot be
-// answered from a connection that is not that role.
+// answered from a connection that is not that role — and neither can
+// row_security_active, which is a question about the current role.
 func (e *Enforcement) readAsRole(ctx context.Context, tx TenantTx, tables []string) error {
 	err := tx.QueryRow(ctx, `
 		SELECT current_user,
+		       session_user,
 		       coalesce(r.rolsuper, false),
 		       coalesce(r.rolbypassrls, false)
 		FROM pg_roles r
 		WHERE r.rolname = current_user
-	`).Scan(&e.Role, &e.Superuser, &e.BypassRLS)
+	`).Scan(&e.Role, &e.SessionRole, &e.Superuser, &e.BypassRLS)
 	if err != nil {
 		return fmt.Errorf("%w: reading the effective role's attributes", domain.ErrUnavailable)
 	}
@@ -197,11 +226,13 @@ func tableEnforcement(ctx context.Context, tx TenantTx, table string) (TableEnfo
 		       EXISTS (
 		           SELECT 1 FROM pg_policy p
 		           WHERE p.polrelid = c.oid AND p.polname = $2
-		       )
+		       ),
+		       row_security_active(c.oid)
 		FROM pg_class c
 		WHERE c.oid = to_regclass($1)
 	`, table, TenantPolicyName).Scan(
 		&out.RowSecurityEnabled, &out.RowSecurityForced, &out.OwnedByRole, &out.PolicyPresent,
+		&out.RowSecurityActive,
 	)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -282,6 +313,17 @@ func (e Enforcement) Findings() []string {
 				" and its row security is not FORCEd, so the policy does not bind the role that runs the statements")
 		case !t.RowSecurityForced:
 			out = append(out, t.Table+" does not have row-level security FORCEd, so its owner is exempt from its own policy")
+		case !t.RowSecurityActive:
+			// Last, because it is the authoritative answer and every case
+			// above is a reason it would be false that can be named more
+			// usefully. Reaching here means Postgres says this role's
+			// statements are not filtered for a reason none of those
+			// covers, which is worth reporting as itself rather than
+			// leaving a deployment to conclude it is fail-closed because
+			// the inputs looked right.
+			out = append(out, "row_security_active("+t.Table+") is false for "+e.Role+
+				", so its policies do not filter this role's statements, even though the table is enabled, "+
+				"FORCEd and carries the "+TenantPolicyName+" policy")
 		}
 	}
 

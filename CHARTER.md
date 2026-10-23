@@ -46,6 +46,55 @@ reuse, partial borrow during pool retirement. CAS has already found and fixed
 TOCTOU and partial-borrow bugs in exactly this area, and those regression tests
 come with the code.
 
+## Where a pool's credential comes from, and why that is in scope
+
+Added 2026-10-23, after a spike measured OpenBao's database secrets engine
+against a real Postgres
+(`docs/superpowers/spikes/2026-10-23-openbao-db-credentials.md`).
+
+The charter already says **pgx pool and handle lifecycle**. What a pool
+authenticates as, and for how long, turns out to be inseparable from that
+rather than adjacent to it: a credential that expires cannot be swapped
+underneath a live `*pgxpool.Pool`, so the only safe response to one is to
+retire the pool, drain the transactions already running on it, and build a
+replacement — which is pool lifecycle, performed for a new reason, on the
+reference counting this module already had.
+
+So the credential is a **port in this module with two adapters**, and the
+boundary is drawn like this:
+
+- In scope: the port (`tenancy.Credentials`), the default adapter that hands
+  back the credential a pool row already carries, the one adapter that issues
+  dynamic Postgres credentials from OpenBao's **database** engine, and the
+  pool retirement that an expiry forces.
+- Not in scope, and deliberately: OpenBao's **transit** engine, which is
+  `keyring`'s. A database login is not key material, and the two modules
+  talking to the same server is not a reason to merge them — they talk to
+  different engines, for different things, and `keyring`'s adapter is the one
+  that must never see a plaintext key.
+- Also not in scope: provisioning. This module reads credentials and never
+  creates an OpenBao role, because creating one needs privileges the process
+  serving requests must not hold. What it does ship is
+  `openbao.CreationStatements`, so an operator's role configuration comes
+  from here rather than from a copy of some SQL, and `CheckRole`, so a
+  deployment can find out at startup whether the server agrees.
+
+Two things about the shape are worth recording because they were decided
+against alternatives:
+
+1. **Dynamic only.** OpenBao's static roles are refused rather than
+   supported. A static rotation leaves a pool that is already broken and
+   still reports healthy — `pool.Ping` returned `nil` for a whole watch
+   window while every new connection failed `28P01` — and with pgx's default
+   one-hour `MaxConnLifetime` that pool works for an hour and then dies all
+   at once, blaming a password. The refusal, and what a deployment that wants
+   static anyway would have to do instead, is in the adapter's package doc.
+2. **The lead time is required configuration, not a default.** It is the
+   longest transaction a deployment serves, so it is a fact about that
+   deployment's slowest query; a library guessing it would be guessing how
+   long another system's transactions run, and guessing low does not produce
+   a slow query — it produces a write the application believes succeeded.
+
 ## Two decisions recorded here, both open to reversal
 
 1. **Migrations are not in scope, beyond this module's own registry tables, and

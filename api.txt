@@ -26,6 +26,10 @@ type Config = scope.Config
 
 type Control = registry.Control
 
+type Credential = domain.Credential
+
+type Credentials = domain.Credentials
+
 type DDL = pg.DDL
 
 type DSN = domain.DSN
@@ -63,6 +67,8 @@ func MigrationLockKey() int64
 func MigrationStatus(ctx context.Context, cfg MigrateConfig) ([]Applied, error)
 
 func NewFixedClock(t time.Time) *FixedClock
+
+func NewOpener(cfg PoolConfig) Opener
 
 type NewPool = registry.NewPool
 
@@ -112,6 +118,8 @@ const SecurityModeTenantKey = domain.SecurityModeTenantKey
 
 const SecurityModeVault = domain.SecurityModeVault
 
+type StaticDSNCredentials = domain.StaticDSNCredentials
+
 type SystemClock = domain.SystemClock
 
 type TableEnforcement = pg.TableEnforcement
@@ -138,7 +146,75 @@ const TenantStatusSuspended = domain.TenantStatusSuspended
 
 type TenantTx = pg.TenantTx
 
+package openbao // credentials/openbao
+
+type Config struct {
+	Address string
+	Token string
+	MountPath string
+	Role string
+	RoleFor func(p domain.Pool) (string, error)
+	HTTPClient *http.Client
+	Clock domain.Clock
+}
+
+func (Config) Format(s fmt.State, _ rune)
+
+func (Config) LogValue() slog.Value
+
+func (Config) MarshalJSON() ([]byte, error)
+
+func (Config) String() string
+
+func CreationStatements(appRole string) ([]string, error)
+
+type Credentials struct {
+	// has unexported fields
+}
+
+func (*Credentials) CheckRole(ctx context.Context, role string) (RoleCheck, error)
+
+func (*Credentials) Format(s fmt.State, _ rune)
+
+func (*Credentials) Issue(ctx context.Context, p domain.Pool) (domain.Credential, error)
+
+func (*Credentials) LogValue() slog.Value
+
+func (*Credentials) MarshalJSON() ([]byte, error)
+
+func (*Credentials) Release(ctx context.Context, cred domain.Credential) error
+
+func (*Credentials) String() string
+
+const DefaultMountPath = "database"
+
+const DefaultTimeout = 30 * time.Second
+
+func Open(ctx context.Context, cfg Config) (*Credentials, error)
+
+type RoleCheck struct {
+	Role string
+	Exists bool
+	DefaultTTL time.Duration
+	MaxTTL time.Duration
+	HasValidUntil bool
+	GrantsInheritance bool
+	DeclaresNoInherit bool
+	GrantsRLSBypass bool
+	GrantsObjectCreation bool
+}
+
+func (RoleCheck) Findings() []string
+
+func (RoleCheck) Usable() bool
+
 package tenancytest // tenancytest
+
+type CredentialSource struct {
+	Credentials tenancy.Credentials
+	Deployment Deployment
+	Dynamic bool
+}
 
 type Deployment struct {
 	MigrationDSN tenancy.DSN
@@ -155,6 +231,8 @@ func (Deployment) MarshalJSON() ([]byte, error)
 func (Deployment) String() string
 
 func NoSecretLeaksInAnyRendering(t *testing.T, v any, material []byte)
+
+func RunCredentialsSuite(t *testing.T, newSource func(t *testing.T) CredentialSource)
 
 func RunTenancySuite(t *testing.T, newDeployment func(t *testing.T) Deployment)
 
@@ -198,6 +276,33 @@ func CanonicalTime(t time.Time) time.Time
 
 type Clock interface {
 	Now() time.Time
+}
+
+type Credential struct {
+	Username string
+	Password string
+	LeaseID string
+	IssuedAt time.Time
+	ExpiresAt time.Time
+}
+
+func (Credential) Expires() bool
+
+func (Credential) Format(s fmt.State, _ rune)
+
+func (Credential) IsZero() bool
+
+func (Credential) LogValue() slog.Value
+
+func (Credential) MarshalJSON() ([]byte, error)
+
+func (Credential) String() string
+
+func (Credential) TTL() time.Duration
+
+type Credentials interface {
+	Issue(ctx context.Context, p Pool) (Credential, error)
+	Release(ctx context.Context, cred Credential) error
 }
 
 type DSN string
@@ -288,6 +393,12 @@ const SecurityModeTenantKey SecurityMode = "tenant-key"
 
 const SecurityModeVault SecurityMode = "vault"
 
+type StaticDSNCredentials struct{}
+
+func (StaticDSNCredentials) Issue(context.Context, Pool) (Credential, error)
+
+func (StaticDSNCredentials) Release(context.Context, Credential) error
+
 type SystemClock struct{}
 
 func (SystemClock) Now() time.Time
@@ -356,6 +467,7 @@ func EnableRLS(ctx context.Context, db DDL, tables ...string) error
 
 type Enforcement struct {
 	Role string
+	SessionRole string
 	Superuser bool
 	BypassRLS bool
 	Tables []TableEnforcement
@@ -371,6 +483,8 @@ func IsRLSViolation(err error) bool
 func NewScoped(tenant domain.Tenant, poolRow domain.Pool, db *pgxpool.Pool, appRole string) Scoped
 
 func Open(ctx context.Context, dsn domain.DSN, cfg PoolConfig) (*pgxpool.Pool, error)
+
+func OpenAs(ctx context.Context, dsn domain.DSN, cred domain.Credential, cfg PoolConfig) (*pgxpool.Pool, error)
 
 type PoolConfig struct {
 	MaxConns int32
@@ -422,6 +536,7 @@ type TableEnforcement struct {
 	Table string
 	Exists bool
 	RowSecurityEnabled bool
+	RowSecurityActive bool
 	RowSecurityForced bool
 	PolicyPresent bool
 	OwnedByRole bool
@@ -469,7 +584,7 @@ func NewOpener(cfg pg.PoolConfig) Opener
 
 func NewResolver(registry Registry, open Opener, opts Options) *CachingResolver
 
-type Opener func(ctx context.Context, p domain.Pool) (*pgxpool.Pool, error)
+type Opener func(ctx context.Context, p domain.Pool, cred domain.Credential) (*pgxpool.Pool, error)
 
 type Options struct {
 	TTL time.Duration
@@ -477,6 +592,8 @@ type Options struct {
 	MaxPools int
 	MaxTenants int
 	Clock domain.Clock
+	Credentials domain.Credentials
+	LongestTransaction time.Duration
 }
 
 type Registry interface {
@@ -552,6 +669,7 @@ type Config struct {
 	Cache pool.Options
 	Clock domain.Clock
 	Opener pool.Opener
+	Credentials domain.Credentials
 }
 
 func (Config) Format(s fmt.State, _ rune)

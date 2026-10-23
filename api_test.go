@@ -37,6 +37,11 @@ var updateAPI = flag.Bool("update-api", false, "rewrite api.txt from the current
 // internal/scope (Tenancy and Config) and internal/migrate (the migration
 // configuration and the schema and identity constants).
 //
+// credentials/openbao is listed for the same reason the facade's own
+// package is: it is a package a consumer imports directly, to wire the one
+// adapter of the credentials port that talks to anything. Its Config is
+// deployment surface.
+//
 // testdb is listed as an importable package rather than skipped, which is
 // where this module differs from audit's and pgmigrate's golden files. Its
 // harness is not this module's private scaffolding: CONVENTIONS.md makes
@@ -45,6 +50,7 @@ var updateAPI = flag.Bool("update-api", false, "rewrite api.txt from the current
 // their test suites. That makes it reviewable surface.
 var apiPackages = []string{
 	".",
+	"credentials/openbao",
 	"tenancytest",
 	"testdb",
 	"internal/domain",

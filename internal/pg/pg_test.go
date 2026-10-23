@@ -219,10 +219,12 @@ func TestEnforcementFindingsDistinguishEveryBypass(t *testing.T) {
 	t.Parallel()
 
 	healthy := pg.Enforcement{
-		Role: "app",
+		Role:        "app",
+		SessionRole: "v-token-app-role-abc",
 		Tables: []pg.TableEnforcement{{
 			Table: "x.y", Exists: true,
 			RowSecurityEnabled: true, RowSecurityForced: true, PolicyPresent: true,
+			RowSecurityActive: true,
 		}},
 	}
 	if !healthy.FailClosed() {
@@ -245,6 +247,16 @@ func TestEnforcementFindingsDistinguishEveryBypass(t *testing.T) {
 			"not forced and owned by the role",
 			func(e *pg.Enforcement) { e.Tables[0].RowSecurityForced = false; e.Tables[0].OwnedByRole = true },
 			"does not bind the role that runs the statements",
+		},
+		// The authoritative measurement, and the one case every field
+		// above is only an input to: Postgres says this role's statements
+		// are not filtered, while enabled, FORCEd and the policy all look
+		// right. Whatever the reason, a deployment in that state is not
+		// fail-closed and must not be told it is.
+		{
+			"row security not active for the role",
+			func(e *pg.Enforcement) { e.Tables[0].RowSecurityActive = false },
+			"row_security_active",
 		},
 	}
 
@@ -275,6 +287,7 @@ func TestEnforcementFindingsDistinguishEveryBypass(t *testing.T) {
 	ownedButForced.Tables = []pg.TableEnforcement{{
 		Table: "x.y", Exists: true,
 		RowSecurityEnabled: true, RowSecurityForced: true, PolicyPresent: true, OwnedByRole: true,
+		RowSecurityActive: true,
 	}}
 	if !ownedButForced.FailClosed() {
 		t.Errorf("owning a FORCEd table is reported as not fail-closed, but FORCE is exactly what covers "+

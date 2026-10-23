@@ -118,7 +118,7 @@ func testPool(id domain.PoolID, dsn domain.DSN) domain.Pool {
 // called and builds a real, lazily-connecting *pgxpool.Pool, so tests can
 // assert "one *pgxpool.Pool per domain.Pool" without a real database.
 func countingOpener(calls *int32) pool.Opener {
-	return func(ctx context.Context, p domain.Pool) (*pgxpool.Pool, error) {
+	return func(ctx context.Context, p domain.Pool, _ domain.Credential) (*pgxpool.Pool, error) {
 		atomic.AddInt32(calls, 1)
 		cfg, err := pgxpool.ParseConfig(string(p.MetadataDSN))
 		if err != nil {
@@ -701,8 +701,8 @@ func TestClose_AccountsForEntriesEvictedBeforeClose(t *testing.T) {
 
 	var mu sync.Mutex
 	var opened []*pgxpool.Pool
-	recordingOpener := func(ctx context.Context, p domain.Pool) (*pgxpool.Pool, error) {
-		db, err := countingOpener(new(int32))(ctx, p)
+	recordingOpener := func(ctx context.Context, p domain.Pool, _ domain.Credential) (*pgxpool.Pool, error) {
+		db, err := countingOpener(new(int32))(ctx, p, domain.Credential{})
 		if err != nil {
 			return nil, err
 		}

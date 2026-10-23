@@ -77,7 +77,7 @@ func (f *toctouFakeRegistry) PoolByID(_ context.Context, id domain.PoolID) (doma
 	return p, nil
 }
 
-func toctouOpener(ctx context.Context, p domain.Pool) (*pgxpool.Pool, error) {
+func toctouOpener(ctx context.Context, p domain.Pool, _ domain.Credential) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(string(p.MetadataDSN))
 	if err != nil {
 		return nil, err

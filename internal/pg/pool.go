@@ -114,9 +114,39 @@ type PoolConfig struct {
 // of the registry by the resolver on behalf of a request. See
 // TestResolve_NeverLeaksMetadataDSN.
 func Open(ctx context.Context, dsn domain.DSN, cfg PoolConfig) (*pgxpool.Pool, error) {
+	return OpenAs(ctx, dsn, domain.Credential{}, cfg)
+}
+
+// OpenAs is Open, connecting as cred's user and password instead of the ones
+// dsn carries. The zero Credential overrides nothing, so Open is exactly
+// OpenAs with no credential.
+//
+// # Why the override is applied to the parsed configuration
+//
+// The obvious implementation — building a new connection string with the
+// issued username and password substituted in — would make this module take
+// a DSN apart and put it back together. A DSN comes in two syntaxes (URL and
+// keyword/value) whose quoting rules differ, and a mistake there does not
+// fail loudly: it produces a string that parses into a *different*
+// connection, or one that carries the issued password into a rendering this
+// module's redaction does not reach. So the text is never rewritten. pgx has
+// already parsed the DSN by this point and User and Password are plain
+// fields on the result; assigning them is the whole override.
+//
+// Everything else about where to connect — host, port, database, TLS, every
+// runtime parameter — therefore still comes from the pool row's own DSN. A
+// Credentials implementation decides *who* connects and never *where*, which
+// is what stops a credential issuer being able to point a tenant's traffic at
+// a database of its own choosing.
+func OpenAs(ctx context.Context, dsn domain.DSN, cred domain.Credential, cfg PoolConfig) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(string(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("%w: the connection string is not valid", domain.ErrInvalidConfig)
+	}
+
+	if cred.Username != "" {
+		poolCfg.ConnConfig.User = cred.Username
+		poolCfg.ConnConfig.Password = cred.Password
 	}
 
 	connectTimeout := cfg.ConnectTimeout
