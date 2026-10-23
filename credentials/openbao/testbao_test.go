@@ -155,7 +155,13 @@ func baoFor(t *testing.T, dsn tenancy.DSN, appRole string, clock tenancy.Clock) 
 	// also what the spike measured against.
 	connectionURL := fmt.Sprintf("postgresql://{{username}}:{{password}}@%s:%d/%s?sslmode=disable",
 		testcontainers.HostInternal, target.port, target.database)
-	err := srv.do(ctx, http.MethodPost, mount+"/config/target", map[string]any{
+	// G101 fires on the "password" key below and is the finding working
+	// correctly: a literal map carrying a password is exactly what it should
+	// flag. It is silenced here because this is the one place in this project
+	// where a database's root credential genuinely has to be sent in the
+	// clear — OpenBao cannot manage a database it cannot log in to — and it
+	// is the ephemeral container's, not a deployment's.
+	err := srv.do(ctx, http.MethodPost, mount+"/config/target", map[string]any{ //nolint:gosec // see above
 		"plugin_name":              "postgresql-database-plugin",
 		"allowed_roles":            "*",
 		"connection_url":           connectionURL,

@@ -198,7 +198,13 @@ func TestPoolRetiresBeforeItsLeaseExpiresAndInFlightWorkCommits(t *testing.T) {
 		// A second resolution, on its own context so that its borrow is
 		// accounted separately. It must come back on a new pool built on a
 		// new credential.
-		replacementCtx, releaseReplacement := context.WithCancel(context.Background())
+		//
+		// The context is this transaction's, with its cancellation
+		// detached: tying the replacement pool's borrow to the lifetime of
+		// the transaction being drained is the one thing this test must not
+		// do, since that borrow is what keeps the replacement alive after
+		// the drain.
+		replacementCtx, releaseReplacement := context.WithCancel(context.WithoutCancel(ctx))
 		defer releaseReplacement()
 
 		replacement, scopeErr := e.tenancy.Scope(replacementCtx, e.tenant.ID)
