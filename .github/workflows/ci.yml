@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          # Pinned to the version in go.mod and mise.toml. CGO_ENABLED=0 is a
+          # release constraint, not a test one — see the test-race job.
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: build (cgo-free, as shipped)
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: gofumpt
+        run: |
+          go install mvdan.cc/gofumpt@v0.9.2
+          test -z "$(gofumpt -l .)" || { gofumpt -d .; exit 1; }
+
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.11.4
+
+      - name: test (inner loop — no containers, no databases)
+        run: go test ./... -short
+
+      - name: api.txt is current
+        # The public surface is a golden file; growing it must be a reviewed
+        # diff rather than a surprise.
+        run: |
+          go test ./... -run TestAPIGolden -update-api
+          git diff --exit-code -- api.txt
+
+  test-race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: false
+      - name: test with race detector and containers
+        # The race detector needs cgo; the cgo-free guarantee is proven by the
+        # build job above.
+        env:
+          CGO_ENABLED: "1"
+        run: go test ./... -race
