@@ -153,13 +153,37 @@ func TestLengthIsTreatedAsDisclosure(t *testing.T) {
 	}
 }
 
-// TestLengthNeedleIsMatchedOnlyAsItsOwnToken guards the one false positive
-// this subtest could plausibly produce: a longer token that happens to contain
-// the material's length as a substring.
-func TestLengthNeedleIsMatchedOnlyAsItsOwnToken(t *testing.T) {
+// TestLengthNeedleFiresOnlyOnAQualifiedLength pins both halves of the length
+// needle's rule: the number must be its own token, and a length word must be
+// near it.
+//
+// The second half is here because of a real failure, not a hypothetical one.
+// A credential rendering its expiry as 2026-10-23T15:20:08Z contains a
+// standalone 20 between two colons, so a 20-byte secret — OpenBao's default
+// password length — failed this subtest at 15:20 and passed at 15:21. The
+// clock is not allowed to decide whether a security test passes.
+// TestTheClockCannotFailThisSubtest is the regression for the 15:20 failure:
+// the real needle set for a 20-byte secret, against a rendering that carries a
+// timestamp, must be clean.
+func TestTheClockCannotFailThisSubtest(t *testing.T) {
 	t.Parallel()
 
-	n := needle{what: "length", text: "32", standalone: true}
+	material := []byte("twenty-bytes-exactly")
+	if len(material) != 20 {
+		t.Fatalf("fixture is %d bytes, the point of it is 20", len(material))
+	}
+	const rendered = "tenancy.Credential([REDACTED] expires 2026-10-23T15:20:08Z)"
+	for _, n := range leakNeedles(material) {
+		if n.contained(rendered) {
+			t.Errorf("needle %q (%s) matched a rendering that discloses nothing: %q", n.text, n.what, rendered)
+		}
+	}
+}
+
+func TestLengthNeedleFiresOnlyOnAQualifiedLength(t *testing.T) {
+	t.Parallel()
+
+	n := needle{what: "length", text: "32", qualified: true}
 	// A ULID is in this list because every id in these modules is one, and a
 	// two-digit number appearing somewhere inside twenty-six alphanumerics is
 	// near certain.
@@ -168,9 +192,16 @@ func TestLengthNeedleIsMatchedOnlyAsItsOwnToken(t *testing.T) {
 			t.Errorf("the length needle matched inside a longer token: %q", s)
 		}
 	}
-	for _, s := range []string{"len=32", "32 bytes", "32", "(32)"} {
+	// Standalone but unqualified: nothing says these numbers measure anything,
+	// and this is the flake the nearby-word rule exists to stop.
+	for _, s := range []string{"32", "(32)", "15:32:08", "WorkerCapacity:32", "2026-10-23T15:32:08Z"} {
+		if n.contained(s) {
+			t.Errorf("the length needle fired on a bare number with no length word near it: %q", s)
+		}
+	}
+	for _, s := range []string{"len=32", "32 bytes", "[]uint8(len=32)", "DEK(redacted, 32 bytes)", "Length: 32", "size=32"} {
 		if !n.contained(s) {
-			t.Errorf("the length needle failed to match a standalone occurrence: %q", s)
+			t.Errorf("the length needle failed to match a qualified length: %q", s)
 		}
 	}
 }
