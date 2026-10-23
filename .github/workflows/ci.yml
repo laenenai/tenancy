@@ -20,36 +20,54 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          # Pinned to the version in go.mod and mise.toml. CGO_ENABLED=0 is a
-          # release constraint, not a test one — see the test-race job.
           go-version-file: go.mod
           check-latest: false
 
+      # Some repositories in this set are chartered but not yet implemented.
+      # Their CI should pass trivially and start doing real work the moment a
+      # package appears, rather than failing on "matched no packages".
+      - name: detect Go packages
+        id: pkgs
+        run: |
+          if [ -n "$(go list ./... 2>/dev/null)" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No Go packages yet — see README status." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: build (cgo-free, as shipped)
+        if: steps.pkgs.outputs.found == 'true'
         env:
           CGO_ENABLED: "0"
         run: go build ./...
 
       - name: vet
+        if: steps.pkgs.outputs.found == 'true'
         run: go vet ./...
 
       - name: gofumpt
+        if: steps.pkgs.outputs.found == 'true'
         run: |
           go install mvdan.cc/gofumpt@v0.9.2
           test -z "$(gofumpt -l .)" || { gofumpt -d .; exit 1; }
 
       - uses: golangci/golangci-lint-action@v8
+        if: steps.pkgs.outputs.found == 'true'
         with:
           version: v2.11.4
 
       - name: test (inner loop — no containers, no databases)
+        if: steps.pkgs.outputs.found == 'true'
         run: go test ./... -short
 
       - name: api.txt is current
-        # The public surface is a golden file; growing it must be a reviewed
-        # diff rather than a surprise.
+        # The golden file is produced by the ROOT package's api_test.go, so the
+        # -update-api flag is only defined there. `go test ./...` would hand it
+        # to every other package's test binary, which rejects it as unknown.
+        if: steps.pkgs.outputs.found == 'true'
         run: |
-          go test ./... -run TestAPIGolden -update-api
+          go test . -run TestAPIGolden -update-api
           git diff --exit-code -- api.txt
 
   test-race:
@@ -60,9 +78,18 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: false
+      - name: detect Go packages
+        id: pkgs
+        run: |
+          if [ -n "$(go list ./... 2>/dev/null)" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: test with race detector and containers
         # The race detector needs cgo; the cgo-free guarantee is proven by the
         # build job above.
+        if: steps.pkgs.outputs.found == 'true'
         env:
           CGO_ENABLED: "1"
         run: go test ./... -race
