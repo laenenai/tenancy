@@ -178,10 +178,38 @@ func Status(ctx context.Context, cfg Config) ([]Applied, error) {
 }
 
 // resolvedConfig is Config validated, so nothing downstream re-checks it.
+//
+// It carries the migration DSN in an unexported field, which is the shape fmt
+// renders most dangerously: a value reached through an unexported field fails
+// reflect.Value.CanInterface, so fmt abandons the method path for the whole
+// subtree and prints it by raw reflection — domain.DSN's own redaction
+// included. The four methods below are why it does not. See CONVENTIONS.md's
+// "Rendering a secret"; redactlint reports exactly this shape.
 type resolvedConfig struct {
 	dsn      domain.DSN
 	appRole  string
 	postgres pg.PoolConfig
+}
+
+// String names the application role and redacts the migration credential.
+func (c resolvedConfig) String() string {
+	return fmt.Sprintf("migrate.resolvedConfig{dsn: %s, appRole: %q, postgres: %+v}",
+		c.dsn, c.appRole, c.postgres)
+}
+
+// Format implements fmt.Formatter, the only interface fmt consults for every
+// verb.
+func (c resolvedConfig) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, c.String()) }
+
+// MarshalJSON renders the same summary as a JSON string.
+func (c resolvedConfig) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// LogValue renders it as a slog group with the credential redacted.
+func (c resolvedConfig) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("dsn", domain.Redacted),
+		slog.String("app_role", c.appRole),
+	)
 }
 
 func (c Config) resolve() (resolvedConfig, error) {
