@@ -28,6 +28,8 @@ type Control = registry.Control
 
 type DDL = pg.DDL
 
+type DSN = domain.DSN
+
 const DefaultMaxTenants = pool.DefaultMaxTenants
 
 func EnableRLS(ctx context.Context, db DDL, tables ...string) error
@@ -139,10 +141,20 @@ type TenantTx = pg.TenantTx
 package tenancytest // tenancytest
 
 type Deployment struct {
-	MigrationDSN string
-	RuntimeDSN string
+	MigrationDSN tenancy.DSN
+	RuntimeDSN tenancy.DSN
 	AppRole string
 }
+
+func (Deployment) Format(s fmt.State, _ rune)
+
+func (Deployment) LogValue() slog.Value
+
+func (Deployment) MarshalJSON() ([]byte, error)
+
+func (Deployment) String() string
+
+func NoSecretLeaksInAnyRendering(t *testing.T, v any, material []byte)
 
 func RunTenancySuite(t *testing.T, newDeployment func(t *testing.T) Deployment)
 
@@ -154,15 +166,23 @@ type DB struct {
 	// has unexported fields
 }
 
-func (*DB) DSN() string
+func (*DB) DSN() domain.DSN
+
+func (*DB) Format(s fmt.State, _ rune)
+
+func (*DB) LogValue() slog.Value
+
+func (*DB) MarshalJSON() ([]byte, error)
 
 func (*DB) Name() string
 
 func (*DB) Pool() *pgxpool.Pool
 
-type Migrator func(ctx context.Context, dsn string) error
+func (*DB) String() string
 
-func NoMigrations(context.Context, string) error
+type Migrator func(ctx context.Context, dsn domain.DSN) error
+
+func NoMigrations(context.Context, domain.DSN) error
 
 type Option func(*options)
 
@@ -179,6 +199,20 @@ func CanonicalTime(t time.Time) time.Time
 type Clock interface {
 	Now() time.Time
 }
+
+type DSN string
+
+func (DSN) Format(s fmt.State, _ rune)
+
+func (DSN) IsZero() bool
+
+func (DSN) LogValue() slog.Value
+
+func (DSN) MarshalJSON() ([]byte, error)
+
+func (DSN) MarshalText() ([]byte, error)
+
+func (DSN) String() string
 
 var ErrConflict = errors.New("tenancy: conflict")
 
@@ -214,11 +248,19 @@ type Pool struct {
 	ID PoolID
 	Name string
 	Region string
-	MetadataDSN string
+	MetadataDSN DSN
 	BlobConfigRef string
 	WorkerCapacity int
 	CreatedAt time.Time
 }
+
+func (Pool) Format(s fmt.State, _ rune)
+
+func (Pool) LogValue() slog.Value
+
+func (Pool) MarshalJSON() ([]byte, error)
+
+func (Pool) String() string
 
 type PoolID string
 
@@ -233,6 +275,8 @@ const ReadinessPending Readiness = "pending"
 const ReadinessQuarantined Readiness = "quarantined"
 
 const ReadinessReady Readiness = "ready"
+
+const Redacted = "[REDACTED]"
 
 type SecurityMode string
 
@@ -274,10 +318,18 @@ package migrate // internal/migrate
 type Applied = pgmigrate.Applied
 
 type Config struct {
-	DSN string
+	DSN domain.DSN
 	AppRole string
 	Postgres pg.PoolConfig
 }
+
+func (Config) Format(s fmt.State, _ rune)
+
+func (Config) LogValue() slog.Value
+
+func (Config) MarshalJSON() ([]byte, error)
+
+func (Config) String() string
 
 const Identity = "github.com/laenenai/tenancy/internal/migrate"
 
@@ -318,7 +370,7 @@ func IsRLSViolation(err error) bool
 
 func NewScoped(tenant domain.Tenant, poolRow domain.Pool, db *pgxpool.Pool, appRole string) Scoped
 
-func Open(ctx context.Context, dsn string, cfg PoolConfig) (*pgxpool.Pool, error)
+func Open(ctx context.Context, dsn domain.DSN, cfg PoolConfig) (*pgxpool.Pool, error)
 
 type PoolConfig struct {
 	MaxConns int32
@@ -350,7 +402,15 @@ func (Scoped) AppRole() string
 
 func (Scoped) CheckEnforcement(ctx context.Context, tables ...string) (Enforcement, error)
 
+func (Scoped) Format(st fmt.State, _ rune)
+
+func (Scoped) LogValue() slog.Value
+
+func (Scoped) MarshalJSON() ([]byte, error)
+
 func (Scoped) Pool() domain.Pool
+
+func (Scoped) String() string
 
 func (Scoped) Tenant() domain.Tenant
 
@@ -431,7 +491,7 @@ type Resolver interface {
 package registry // internal/registry
 
 type Config struct {
-	DSN string
+	DSN domain.DSN
 	Postgres pg.PoolConfig
 	Clock domain.Clock
 }
@@ -460,10 +520,18 @@ type NewPool struct {
 	ID domain.PoolID
 	Name string
 	Region string
-	MetadataDSN string
+	MetadataDSN domain.DSN
 	BlobConfigRef string
 	WorkerCapacity int
 }
+
+func (NewPool) Format(s fmt.State, _ rune)
+
+func (NewPool) LogValue() slog.Value
+
+func (NewPool) MarshalJSON() ([]byte, error)
+
+func (NewPool) String() string
 
 type NewTenant struct {
 	ID domain.TenantID
@@ -478,13 +546,21 @@ func Open(ctx context.Context, cfg Config) (*Control, error)
 package scope // internal/scope
 
 type Config struct {
-	RegistryDSN string
+	RegistryDSN domain.DSN
 	AppRole string
 	Postgres pg.PoolConfig
 	Cache pool.Options
 	Clock domain.Clock
 	Opener pool.Opener
 }
+
+func (Config) Format(s fmt.State, _ rune)
+
+func (Config) LogValue() slog.Value
+
+func (Config) MarshalJSON() ([]byte, error)
+
+func (Config) String() string
 
 func Open(ctx context.Context, cfg Config) (*Tenancy, error)
 

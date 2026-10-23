@@ -39,8 +39,11 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -69,7 +72,7 @@ type Config struct {
 	// See internal/migrate's package doc comment for the two-pool model.
 	//
 	// Required.
-	DSN string
+	DSN domain.DSN
 
 	// Postgres tunes the control-plane pool. The control plane is
 	// read-mostly and low-volume, so a small MaxConns is appropriate; the
@@ -89,7 +92,7 @@ type Config struct {
 // would mean this pool held the migration rights for the life of the
 // process.
 func Open(ctx context.Context, cfg Config) (*Control, error) {
-	if cfg.DSN == "" {
+	if cfg.DSN.IsZero() {
 		return nil, fmt.Errorf(
 			"%w: registry: DSN is required: it is the control plane's connection to the registry database",
 			domain.ErrInvalidConfig)
@@ -128,7 +131,7 @@ type NewPool struct {
 	Region string
 	// MetadataDSN is the pool's Postgres connection string on the
 	// application role. It is never logged and never embedded in an error.
-	MetadataDSN string
+	MetadataDSN domain.DSN
 	// BlobConfigRef names the blob store configuration, as a reference.
 	BlobConfigRef string
 	// WorkerCapacity bounds concurrent background jobs in this pool.
@@ -171,7 +174,7 @@ func (c *Control) CreatePool(ctx context.Context, in NewPool) (domain.Pool, erro
 	if in.Region == "" {
 		return domain.Pool{}, fmt.Errorf("%w: registry: a pool needs a region: it is what makes residency a placement decision", domain.ErrInvalidConfig)
 	}
-	if in.MetadataDSN == "" {
+	if in.MetadataDSN.IsZero() {
 		return domain.Pool{}, fmt.Errorf("%w: registry: a pool needs a metadata DSN", domain.ErrInvalidConfig)
 	}
 	if in.WorkerCapacity < 0 {
@@ -182,7 +185,7 @@ func (c *Control) CreatePool(ctx context.Context, in NewPool) (domain.Pool, erro
 		ID:             in.ID,
 		Name:           in.Name,
 		Region:         in.Region,
-		MetadataDsn:    in.MetadataDSN,
+		MetadataDsn:    string(in.MetadataDSN),
 		BlobConfigRef:  in.BlobConfigRef,
 		WorkerCapacity: int32(in.WorkerCapacity), //nolint:gosec // bounded above by the non-negative check and by the column's integer width
 	})
@@ -320,7 +323,7 @@ func (c *Control) poolFrom(row gen.TenancyPool) domain.Pool {
 		ID:             row.ID,
 		Name:           row.Name,
 		Region:         row.Region,
-		MetadataDSN:    row.MetadataDsn,
+		MetadataDSN:    domain.DSN(row.MetadataDsn),
 		BlobConfigRef:  row.BlobConfigRef,
 		WorkerCapacity: int(row.WorkerCapacity),
 		CreatedAt:      domain.CanonicalTime(row.CreatedAt),
@@ -369,4 +372,33 @@ func mapErr(what string, err error) error {
 	}
 
 	return fmt.Errorf("%w: %s", domain.ErrUnavailable, what)
+}
+
+// String names the pool being created and redacts its MetadataDSN. NewPool is
+// the value a consumer builds by hand and is therefore the value most likely
+// to appear in its own logging around CreatePool — see CONVENTIONS.md's
+// "Rendering a secret".
+func (in NewPool) String() string {
+	return fmt.Sprintf("tenancy.NewPool{ID: %s, Name: %q, Region: %q, MetadataDSN: %s, BlobConfigRef: %q, WorkerCapacity: %d}",
+		in.ID, in.Name, in.Region, in.MetadataDSN, in.BlobConfigRef, in.WorkerCapacity)
+}
+
+// Format implements fmt.Formatter, the only interface fmt consults for every
+// verb.
+func (in NewPool) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, in.String()) }
+
+// MarshalJSON renders the same summary as a JSON string.
+func (in NewPool) MarshalJSON() ([]byte, error) { return json.Marshal(in.String()) }
+
+// LogValue renders the request as a slog group with the metadata DSN
+// redacted.
+func (in NewPool) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("pool_id", string(in.ID)),
+		slog.String("name", in.Name),
+		slog.String("region", in.Region),
+		slog.String("metadata_dsn", domain.Redacted),
+		slog.String("blob_config_ref", in.BlobConfigRef),
+		slog.Int("worker_capacity", in.WorkerCapacity),
+	)
 }

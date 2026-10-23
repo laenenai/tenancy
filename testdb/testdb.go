@@ -58,7 +58,10 @@ package testdb
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
@@ -104,12 +107,12 @@ const adminConnectTimeout = 10 * time.Second
 // defeat the point. `cas` and `audit`'s harnesses both passed a pool,
 // which is the one place this harness deliberately differs from the copies
 // it replaces.
-type Migrator func(ctx context.Context, dsn string) error
+type Migrator func(ctx context.Context, dsn domain.DSN) error
 
 // NoMigrations is a Migrator that leaves the database untouched. It is how
 // a test gets a database that exists but is not yet migrated, which is the
 // only way to test migrating.
-func NoMigrations(context.Context, string) error { return nil }
+func NoMigrations(context.Context, domain.DSN) error { return nil }
 
 // Option configures Start.
 type Option func(*options)
@@ -127,7 +130,7 @@ func WithMigrator(m Migrator) Option {
 // DB is an isolated database created for a single test by Start.
 type DB struct {
 	pool *pgxpool.Pool
-	dsn  string
+	dsn  domain.DSN
 	name string
 }
 
@@ -149,10 +152,37 @@ func (d *DB) Pool() *pgxpool.Pool { return d.pool }
 //
 // It is what a test passes to tenancy.Migrate as the migration
 // credential, and what it registers as a pool's metadata DSN.
-func (d *DB) DSN() string { return d.dsn }
+func (d *DB) DSN() domain.DSN { return d.dsn }
 
 // Name returns this test database's name.
 func (d *DB) Name() string { return d.name }
+
+// String names this test database and redacts its connection string.
+//
+// A *DB holds its DSN in an unexported field, which is the shape fmt renders
+// most dangerously: a value reached through an unexported field fails
+// reflect.Value.CanInterface, so fmt abandons the method path for the whole
+// subtree and prints it by raw reflection — the DSN type's own redaction
+// included. Before these four methods, %+v on a *DB printed the container's
+// superuser credential. See CONVENTIONS.md's "Rendering a secret".
+func (d *DB) String() string {
+	return fmt.Sprintf("testdb.DB{name: %q, dsn: %s}", d.name, domain.Redacted)
+}
+
+// Format implements fmt.Formatter, the only interface fmt consults for every
+// verb.
+func (d *DB) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, d.String()) }
+
+// MarshalJSON renders the redacted summary.
+func (d *DB) MarshalJSON() ([]byte, error) { return json.Marshal(d.String()) }
+
+// LogValue renders the database as a slog group with the DSN redacted.
+func (d *DB) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("name", d.name),
+		slog.String("dsn", domain.Redacted),
+	)
+}
 
 var (
 	containerOnce sync.Once
@@ -217,28 +247,28 @@ func Start(t *testing.T, opts ...Option) *DB {
 		dropDatabase(t, serverDSN, dbName)
 	})
 
-	testDSN, err := withDatabaseName(serverDSN, dbName)
+	rawTestDSN, err := withDatabaseName(serverDSN, dbName)
 	if err != nil {
 		t.Fatalf("testdb: build a dsn for database %s: %v", dbName, err)
 	}
 
-	if err := cfg.migrator(ctx, testDSN); err != nil {
+	if err := cfg.migrator(ctx, domain.DSN(rawTestDSN)); err != nil {
 		t.Fatalf("testdb: run the migrator against database %s: %v", dbName, err)
 	}
 
-	pool, err = openPool(ctx, testDSN)
+	pool, err = openPool(ctx, domain.DSN(rawTestDSN))
 	if err != nil {
 		t.Fatalf("testdb: open a pool for database %s: %v", dbName, err)
 	}
 
-	return &DB{pool: pool, dsn: testDSN, name: dbName}
+	return &DB{pool: pool, dsn: domain.DSN(rawTestDSN), name: dbName}
 }
 
 // openPool opens a pool against dsn and verifies it with one ping, so a
 // failure to connect is reported where it happened rather than inside the
 // first test assertion.
-func openPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
-	poolCfg, err := pgxpool.ParseConfig(dsn)
+func openPool(ctx context.Context, dsn domain.DSN) (*pgxpool.Pool, error) {
+	poolCfg, err := pgxpool.ParseConfig(string(dsn))
 	if err != nil {
 		// The DSN is not forwarded: pgx's parse error can carry an
 		// embedded credential verbatim. It is the harness's own DSN here,

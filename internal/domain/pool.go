@@ -1,6 +1,12 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"time"
+)
 
 // Pool identifies one physical Postgres database that hosts the metadata
 // of one or more tenants, together with the region it lives in and the
@@ -33,7 +39,11 @@ type Pool struct {
 	// embedded in an error: internal/pg.Open is the one place that
 	// touches it, and it is audited for exactly that. See
 	// TestResolve_NeverLeaksMetadataDSN.
-	MetadataDSN string
+	//
+	// Its type carries half of that rule — DSN redacts itself through every
+	// rendering — and Pool's own four methods below carry the other half,
+	// for the case the type cannot reach.
+	MetadataDSN DSN
 	// BlobConfigRef names the blob store configuration this pool's
 	// tenants use — a reference, not the configuration itself, because
 	// blob storage is no business of this module's.
@@ -45,4 +55,43 @@ type Pool struct {
 	// CreatedAt is when the pool was created, canonicalized to UTC
 	// microseconds (see CanonicalTime).
 	CreatedAt time.Time
+}
+
+// String names the pool's id, name, region, blob configuration reference and
+// worker capacity, and redacts its MetadataDSN. Those first five fields are
+// the whole reason a pool row is worth logging; the sixth is a credential.
+//
+// Pool carries these four methods itself rather than leaving the redaction to
+// the DSN type, and that is not belt-and-braces. A Pool reached through an
+// *unexported* field — which is exactly how pg.Scoped and pool.poolEntry hold
+// one — is a value fmt cannot take an interface of, so fmt abandons the method
+// path for the whole subtree and prints it by raw reflection, DSN's own
+// methods included. Measured: %+v on a struct holding a Pool unexported
+// printed the password. See CONVENTIONS.md's "Rendering a secret".
+func (p Pool) String() string {
+	return fmt.Sprintf("tenancy.Pool{ID: %s, Name: %q, Region: %q, MetadataDSN: %s, BlobConfigRef: %q, WorkerCapacity: %d}",
+		p.ID, p.Name, p.Region, p.MetadataDSN, p.BlobConfigRef, p.WorkerCapacity)
+}
+
+// Format implements fmt.Formatter, the only interface fmt consults for every
+// verb. Without it, %#v, %d and %c reflect this struct and print the DSN.
+func (p Pool) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, p.String()) }
+
+// MarshalJSON renders the same summary as a JSON string. MetadataDSN is an
+// exported field, so encoding/json reaches it directly, and slog's
+// JSONHandler is built on encoding/json.
+func (p Pool) MarshalJSON() ([]byte, error) { return json.Marshal(p.String()) }
+
+// LogValue renders the pool as a slog group with the DSN redacted, so
+// slog.Any("pool", p) is safe under every handler.
+func (p Pool) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("pool_id", string(p.ID)),
+		slog.String("name", p.Name),
+		slog.String("region", p.Region),
+		slog.String("metadata_dsn", Redacted),
+		slog.String("blob_config_ref", p.BlobConfigRef),
+		slog.Int("worker_capacity", p.WorkerCapacity),
+		slog.Time("created_at", p.CreatedAt),
+	)
 }

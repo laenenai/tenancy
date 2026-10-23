@@ -21,7 +21,10 @@ package scope
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 
 	"github.com/laenenai/pgmigrate"
 
@@ -39,7 +42,7 @@ type Config struct {
 	// two are different credentials rather than two states of one session.
 	//
 	// Required.
-	RegistryDSN string
+	RegistryDSN domain.DSN
 
 	// AppRole, when set, is the role every data-plane transaction narrows
 	// itself to with SET LOCAL ROLE before running any statement.
@@ -108,7 +111,7 @@ type Tenancy struct {
 // Migrate once at startup, on a credential this Config never sees, and
 // then Open.
 func Open(ctx context.Context, cfg Config) (*Tenancy, error) {
-	if cfg.RegistryDSN == "" {
+	if cfg.RegistryDSN.IsZero() {
 		return nil, fmt.Errorf(
 			"%w: RegistryDSN is required: it is the control plane's connection to the registry database",
 			domain.ErrInvalidConfig)
@@ -197,4 +200,48 @@ func (t *Tenancy) Close() error {
 	err := t.resolver.Close()
 	t.control.Close()
 	return err
+}
+
+// String names the configuration's non-credential fields and redacts its
+// RegistryDSN.
+//
+// Config is the single most likely place for the registry credential to
+// escape: logging or serializing your configuration at startup is the normal
+// thing to do, and before these four methods that wrote the password to the
+// log. RegistryDSN is an exported field of a type that redacts itself, so fmt
+// would reach DSN's own methods here — but json.Marshal of a Config would
+// also have emitted AppRole and the pool limits, and a reader cannot tell at
+// a glance which containers are safe by construction. See CONVENTIONS.md's
+// "Rendering a secret".
+func (cfg Config) String() string {
+	return fmt.Sprintf("tenancy.Config{RegistryDSN: %s, AppRole: %q, Postgres: %+v, Cache: %+v, Clock: %T, Opener: %s}",
+		cfg.RegistryDSN, cfg.AppRole, cfg.Postgres, cfg.Cache, cfg.Clock, openerDescription(cfg.Opener))
+}
+
+// Format implements fmt.Formatter, the only interface fmt consults for every
+// verb.
+func (cfg Config) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, cfg.String()) }
+
+// MarshalJSON renders the same summary as a JSON string.
+func (cfg Config) MarshalJSON() ([]byte, error) { return json.Marshal(cfg.String()) }
+
+// LogValue renders the configuration as a slog group with the registry DSN
+// redacted, so slog.Any("config", cfg) is safe under every handler.
+func (cfg Config) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("registry_dsn", domain.Redacted),
+		slog.String("app_role", cfg.AppRole),
+		slog.String("clock", fmt.Sprintf("%T", cfg.Clock)),
+		slog.String("opener", openerDescription(cfg.Opener)),
+	)
+}
+
+// openerDescription names whether a custom Opener was supplied, which is the
+// part worth logging. The function value itself renders as an address, and an
+// address in a log line is noise.
+func openerDescription(o pool.Opener) string {
+	if o == nil {
+		return "default"
+	}
+	return "custom"
 }

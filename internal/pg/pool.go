@@ -113,8 +113,8 @@ type PoolConfig struct {
 // DSN reaching this function is often a pool row's MetadataDSN, read out
 // of the registry by the resolver on behalf of a request. See
 // TestResolve_NeverLeaksMetadataDSN.
-func Open(ctx context.Context, dsn string, cfg PoolConfig) (*pgxpool.Pool, error) {
-	poolCfg, err := pgxpool.ParseConfig(dsn)
+func Open(ctx context.Context, dsn domain.DSN, cfg PoolConfig) (*pgxpool.Pool, error) {
+	poolCfg, err := pgxpool.ParseConfig(string(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("%w: the connection string is not valid", domain.ErrInvalidConfig)
 	}
