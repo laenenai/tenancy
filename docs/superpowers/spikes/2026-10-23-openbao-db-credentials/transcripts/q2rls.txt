@@ -1,0 +1,34 @@
+dynamic user: v-token-q2-inrol-T6PX55N0z2JxaMPCMu6G-1792728166 (member of app_role)
+
+  root (table owner, superuser)                  6 rows visible
+-- 1. baseline: only the PERMISSIVE tenant policy --
+  dynamic user, tenant-a                         5 rows visible
+
+-- 2. a second PERMISSIVE policy is added (TO PUBLIC USING (true)) --
+  dynamic user, tenant-a                         6 rows visible
+   !! FAIL OPEN: the member now sees all 6 rows; permissive policies OR
+
+-- 3. the tenant predicate is made AS RESTRICTIVE instead --
+  dynamic user, tenant-a                         5 rows visible
+   restrictive policies AND, so the stray permissive policy cannot widen it: 5 rows
+  dynamic user, tenant UNSET (restrictive, must be 0) 0 rows visible
+
+-- 4. the migration credential's relationship to RLS --
+  root rolsuper                          true
+  root rolbypassrls                      true
+  root row_security_active('items')      false
+  items relrowsecurity                   true
+  items relforcerowsecurity              true
+  root sees 6 rows with no tenant set — RLS does not constrain a superuser at all
+
+-- 5. a non-superuser, non-owner DDL role (what a migration credential should be) --
+  mig_role row_security_active('items')   true
+  mig_role, no tenant set, ALL privileges on items 0 rows visible
+  mig_role DDL: ALTER TABLE items ADD COLUMN     DENIED ERROR: must be owner of table items (SQLSTATE 42501)
+  mig_role: DROP the column again                DENIED ERROR: must be owner of table items (SQLSTATE 42501)
+
+-- 6. a migration credential that is a MEMBER OF the owning role --
+  mig_role pg_has_role(tbl_owner,'USAGE')        true
+  mig_role row_security_active('items2')         true
+  mig_role DDL on items2 (owned by tbl_owner)    OK
+  mig_role SELECT items2, no tenant set          0 rows visible (items2 holds 2)

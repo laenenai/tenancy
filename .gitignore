@@ -1,0 +1,20 @@
+# Build and test artifacts
+/dist/
+*.test
+*.out
+coverage.*
+
+# Local workspace files — never committed; a multi-module go.work is kept
+# outside every repository on purpose.
+go.work
+go.work.sum
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local overrides
+.env
+.env.*
+!.env.example

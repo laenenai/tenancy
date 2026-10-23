@@ -1,0 +1,17 @@
+[t+  0.00s] static-creds BEFORE: user=app_runtime lease_duration=0 data={"last_vault_rotation":"2026-10-23T04:02:46.735475597Z","password":"aoLqSMs4tkbVaScs-J1t","rotation_period":600,"ttl":573,"username":"app_runtime"}
+[t+  0.05s] pool warmed: 4 idle connections, backend pids=[155 156 157 158] stat=stat{total=4 idle=4 acquired=0 new=4}
+[t+  0.05s] POST database/rotate-role/app-runtime ...
+[t+  0.06s] rotate-role returned after 0.010s err=<nil>
+[t+  0.06s] static-creds AFTER: user=app_runtime password_changed=true data={"last_vault_rotation":"2026-10-23T04:03:14.111889887Z","password":"W5GNln1XrwRdOp4p-4u7","rotation_period":600,"ttl":600,"username":"app_runtime"}
+[t+  0.07s] pooled: 4/4 ok pids=[157 155 158 156] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=5}
+[t+  3.08s] pooled: 4/4 ok pids=[156 155 158 157] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=6}
+[t+  6.11s] pooled: 4/4 ok pids=[155 158 157 156] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=7}
+[t+  9.14s] pooled: 4/4 ok pids=[156 158 157 155] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=4 idle=4 acquired=0 new=8}
+[t+ 12.18s] pooled: 0/4 ok pids=[] | new connection: FAIL SQLSTATE 28P01: password authentication failed for user "app_runtime" | stat{total=0 idle=0 acquired=0 new=10}
+[t+ 12.18s] POOL IS DEAD: every connection recycled, none replaceable
+[t+ 12.19s] pool.Ping (may reuse an existing connection) -> failed to connect to `user=app_runtime database=spike`: [::1]:55432 (localhost): failed SASL auth: FATAL: password authentication failed for user "app_runtime" (SQLSTATE 28P01)
+
+--- summary ---
+existing pooled connections, first failure: t+12.17s failed to connect to `user=app_runtime database=spike`: [::1]:55432 (localhost): failed SASL auth: FATAL: password authentication failed for user "app_runtime" (SQLSTATE 28P01)
+new connections, first failure:             t+0.07s SQLSTATE 28P01: password authentication failed for user "app_runtime"
+a new connection ever succeeded after rotation: false

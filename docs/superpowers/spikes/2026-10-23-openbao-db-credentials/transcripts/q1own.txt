@@ -1,0 +1,9 @@
+issued user=v-token-q1-owner-YjZeOwUlpijbyQz3CKYm-1792728206 lease=database/creds/q1-owner/wBdUbo7iBqD0W6KmM8IuYrXh ttl=10s
+the dynamic user now OWNS public.q1own_scratch
+revoking the lease explicitly ...
+revoke returned after 0.02s err=PUT sys/leases/revoke: HTTP 400: {"errors":["failed to revoke entry: resp: (*logical.Response)(nil) err: ERROR: role \"v-token-q1-owner-YjZeOwUlpijbyQz3CKYm-1792728206\" cannot be dropped because some objects depend on it (SQLSTATE 2BP01)"]}
+  +  0s role_exists_in_pg=true lease=STILL KNOWN to OpenBao
+  +  5s role_exists_in_pg=true lease=STILL KNOWN to OpenBao
+  + 15s role_exists_in_pg=true lease=STILL KNOWN to OpenBao
+leases still listed under this role: {"keys":["wBdUbo7iBqD0W6KmM8IuYrXh"]}
+cleaned up by hand (DROP TABLE / REASSIGN OWNED / DROP OWNED / DROP ROLE)
