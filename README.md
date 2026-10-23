@@ -7,9 +7,10 @@ Who the tenants are, where their data lives, and a pgx connection already
 scoped to exactly one of them — failing closed if it is not.
 
 > **Status: implemented, unreleased.** The registry, resolution, both
-> connection kinds and the conformance suite are here and green against a
-> real Postgres. No tag yet, and no consumer has swapped over: `cas` keeps
-> its own copy of the extracted code until the post-alpha swap.
+> connection kinds, the credentials port with both its adapters, and the two
+> conformance suites are here and green against a real Postgres and a real
+> OpenBao. No tag yet, and no consumer has swapped over: `cas` keeps its own
+> copy of the extracted code until the post-alpha swap.
 
 ## What it does
 
@@ -103,6 +104,74 @@ this deployment's connection — call it at startup and refuse to serve if
 `FailClosed` is false, because a superuser connection makes every policy
 inert while looking entirely correct from Go.
 
+## Dynamic database credentials, if you want them
+
+By default a pool connects on the credential its registry row's
+`MetadataDSN` already carries: a long-lived password, shared by every process
+that resolves that pool, whose rotation is a fleet-wide event nothing
+announces. `tenancy.StaticDSNCredentials` is that default, it performs no
+I/O, and a deployment that wants nothing to change sets nothing.
+
+The alternative is opt-in and never required: `credentials/openbao` issues a
+credential per pool from OpenBao's database secrets engine, with a lease.
+
+```go
+source, err := openbao.Open(ctx, openbao.Config{
+    Address: "https://openbao.internal:8200",
+    Token:   baoToken,
+    Role:    "myapp-runtime", // or RoleFor, per pool
+})
+if err != nil {
+    return err
+}
+
+// Worth doing at startup: it reads the role's configuration back and
+// reports every way it departs from what this module requires.
+if check, err := source.CheckRole(ctx, "myapp-runtime"); err != nil {
+    return err
+} else if !check.Usable() {
+    return fmt.Errorf("openbao role is misconfigured: %v", check.Findings())
+}
+
+ten, err := tenancy.Open(ctx, tenancy.Config{
+    RegistryDSN: tenancy.DSN(runtimeDSN),
+    Credentials: source,
+    Cache: tenancy.CacheOptions{
+        TTL:         time.Minute,
+        NegativeTTL: 10 * time.Second,
+        // Required with Credentials, and it is a fact about your slowest
+        // query rather than a security preference. See below.
+        LongestTransaction: 2 * time.Minute,
+    },
+})
+```
+
+Configure the OpenBao role's `creation_statements` from
+`openbao.CreationStatements("myapp")` rather than from a copy of some SQL.
+Every clause in it is load-bearing, and three of them are load-bearing in
+ways that do not show up until something has already gone wrong.
+
+**What changes, and what it costs.** A credential that expires cannot be
+swapped underneath a live `*pgxpool.Pool`: expiry is a privilege removal
+rather than a disconnection, so nothing closes, the pool reports itself
+healthy, and a transaction that was already running fails mid-statement and
+then has its `COMMIT` silently turned into a `ROLLBACK`. So each pool is
+*retired* one `LongestTransaction` before its credential expires: it stops
+being handed to new callers, the transactions already on it drain, it closes,
+and a replacement is built on a fresh credential. That lead time is a drain
+window, which is why it is required rather than defaulted, and why a
+credential with less than twice that left to live is refused with both
+numbers named.
+
+It applies to tenant pools only. The control plane's own pool and the
+migration pool keep their static DSNs — neither is reference counted, so
+there is no moment at which replacing one is known to be safe.
+
+The measurements behind all of this, including why OpenBao's *static* roles
+are refused rather than supported, are in
+[`credentials/openbao`](credentials/openbao/openbao.go)'s package doc and in
+[the spike](docs/superpowers/spikes/2026-10-23-openbao-db-credentials.md).
+
 ## The test harness
 
 `tenancy/testdb` is the shared container harness the other modules import
@@ -113,7 +182,8 @@ surface and listed in `api.txt`.
 
 ## Documentation
 
-- [`CHARTER.md`](CHARTER.md) — the boundary, and two recorded decisions open to reversal
+- [`CHARTER.md`](CHARTER.md) — the boundary, and the recorded decisions open to reversal
+- [`docs/superpowers/spikes/`](docs/superpowers/spikes/) — what was measured rather than assumed
 - [`SECURITY.md`](SECURITY.md)
 - `api.txt` — the public surface as a golden file, diffed in CI
 
