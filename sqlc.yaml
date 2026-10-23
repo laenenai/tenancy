@@ -1,0 +1,70 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "db/migrations"
+    queries: "db/queries"
+    gen:
+      go:
+        package: "gen"
+        out: "internal/registry/gen"
+        sql_package: "pgx/v5"
+        emit_pointers_for_null_types: true
+        overrides:
+          # Every id column maps to its internal/domain typed id, never a
+          # bare string: that is the whole point of the typed ids (they
+          # cannot be crossed at a call site), and a generated layer
+          # handing back a string would undo it right at the boundary.
+          # This is cas/sqlc.yaml's pattern applied to this module's two
+          # tables.
+          - column: "tenancy.pools.id"
+            go_type:
+              import: "github.com/laenenai/tenancy/internal/domain"
+              type: "PoolID"
+          - column: "tenancy.tenants.id"
+            go_type:
+              import: "github.com/laenenai/tenancy/internal/domain"
+              type: "TenantID"
+          - column: "tenancy.tenants.pool_id"
+            go_type:
+              import: "github.com/laenenai/tenancy/internal/domain"
+              type: "PoolID"
+          # security_mode and status are closed enums with a Valid method,
+          # so they map to the typed domain enums rather than to bare
+          # strings. A generated layer that returned string here would let
+          # a caller compare against a literal that the enum does not
+          # contain, and the CHECK constraint would be the only thing left
+          # holding the set closed.
+          - column: "tenancy.tenants.security_mode"
+            go_type:
+              import: "github.com/laenenai/tenancy/internal/domain"
+              type: "SecurityMode"
+          - column: "tenancy.tenants.status"
+            go_type:
+              import: "github.com/laenenai/tenancy/internal/domain"
+              type: "TenantStatus"
+          # The timestamptz columns map to time.Time rather than to
+          # pgtype.Timestamptz, which is what pgx/v5 would otherwise
+          # produce for a NOT NULL timestamptz. They are NOT NULL, so the
+          # pgtype wrapper's Valid flag would encode a state the schema
+          # does not permit, and every one of these goes through
+          # domain.CanonicalTime on the way out — a wrapper would put a
+          # .Time dereference between the column and the canonicalizer.
+          - column: "tenancy.pools.created_at"
+            go_type: "time.Time"
+          - column: "tenancy.pools.updated_at"
+            go_type: "time.Time"
+          - column: "tenancy.tenants.created_at"
+            go_type: "time.Time"
+          - column: "tenancy.tenants.updated_at"
+            go_type: "time.Time"
+          # metadata_dsn is deliberately NOT given a type of its own.
+          #
+          # A named type would be the natural way to make "never log this"
+          # a property of the value, and it was considered and rejected:
+          # the only way to make such a type usable at the pgx boundary is
+          # sql.Scanner / driver.Valuer, which CONVENTIONS.md forbids on a
+          # security-relevant value because those methods are exported and
+          # any package could then construct one. The DSN's protection is
+          # instead structural: internal/pg.Open is the one function that
+          # receives it, and it forwards no parse error text at all. See
+          # TestResolve_NeverLeaksMetadataDSN.
