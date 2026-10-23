@@ -142,14 +142,42 @@ func TestEnableRLS_IsIdempotentAndRepairsADriftedPredicate(t *testing.T) {
 		}
 	}
 
+	// Two policies, not one: the tenant predicate is RESTRICTIVE and has a
+	// permissive companion, because a table whose only policies are
+	// restrictive has an empty permissive set and Postgres then denies
+	// every row. Asserting the *kinds* and not just the count is the point
+	// — a permissive tenant policy is OR-able away by any policy a
+	// consumer adds, which is the disclosure this arrangement fixes.
 	var policies int
 	if err := pool.QueryRow(ctx,
 		"SELECT count(*) FROM pg_policies WHERE schemaname = 'rlsfixture' AND tablename = 'scoped'",
 	).Scan(&policies); err != nil {
 		t.Fatalf("count policies: %v", err)
 	}
-	if policies != 1 {
-		t.Fatalf("policy count = %d after three calls, want exactly 1", policies)
+	if policies != 2 {
+		t.Fatalf("policy count = %d after three calls, want exactly 2 "+
+			"(the restrictive tenant policy and its permissive companion)", policies)
+	}
+
+	var tenantKind, accessKind string
+	if err := pool.QueryRow(ctx,
+		"SELECT permissive FROM pg_policies WHERE tablename = 'scoped' AND policyname = $1",
+		pg.TenantPolicyName).Scan(&tenantKind); err != nil {
+		t.Fatalf("read the tenant policy's kind: %v", err)
+	}
+	if tenantKind != "RESTRICTIVE" {
+		t.Fatalf("the tenant policy is %s, want RESTRICTIVE: a permissive tenant predicate "+
+			"is OR-ed away by any additional permissive policy on the table, which is a "+
+			"cross-tenant disclosure", tenantKind)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT permissive FROM pg_policies WHERE tablename = 'scoped' AND policyname = $1",
+		pg.TenantAccessPolicyName).Scan(&accessKind); err != nil {
+		t.Fatalf("read the companion policy's kind: %v", err)
+	}
+	if accessKind != "PERMISSIVE" {
+		t.Fatalf("the companion policy is %s, want PERMISSIVE: with no permissive policy "+
+			"the restrictive one denies every row", accessKind)
 	}
 
 	// Drift the predicate to something that filters nothing, exactly as a
@@ -165,7 +193,8 @@ func TestEnableRLS_IsIdempotentAndRepairsADriftedPredicate(t *testing.T) {
 
 	var using string
 	if err := pool.QueryRow(ctx,
-		"SELECT qual FROM pg_policies WHERE schemaname = 'rlsfixture' AND tablename = 'scoped'",
+		"SELECT qual FROM pg_policies WHERE schemaname = 'rlsfixture' AND tablename = 'scoped' "+
+			"AND policyname = $1", pg.TenantPolicyName,
 	).Scan(&using); err != nil {
 		t.Fatalf("read the policy's USING expression: %v", err)
 	}
