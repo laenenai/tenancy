@@ -19,6 +19,27 @@
 // entirely inside mutex-protected sections — and the only way to test it
 // is an unexported seam a test can pause on. Nobody re-derives that.
 //
+// # Credential-driven retirement reuses that same machinery
+//
+// A pool opened on a credential that expires has to be replaced before it
+// does. The mechanism is not new: "stop handing this entry out, let the
+// transactions already running on it finish, then close it" is exactly what
+// the reference counting above already does for an evicted entry, and
+// poolEntry's doc comment was describing it before any credential here
+// could expire. Credential expiry is one more reason to set retired, and
+// the refcount is what makes it safe — see poolEntry.retireAt for the
+// measurements that decide how far ahead of expiry that happens, and
+// Options.LongestTransaction for the one number a deployment must supply.
+//
+// Retirement is checked when an entry is looked up, not driven by a timer,
+// which is the same lazy, clock-injected shape the TTL caches here already
+// use. The cost is stated rather than hidden: an idle pool nobody resolves
+// again is not retired until somebody does. That is a resource held open,
+// bounded by Options.MaxPools, and not a privilege held open — the
+// credential behind it loses every privilege the moment its lease expires
+// (measured: inside the spike's 2s probe resolution), so an unretired idle
+// pool holds connections that can no longer do anything.
+//
 // See CachingResolver's doc comment for the caching and lifetime rules.
 package pool
 
@@ -80,22 +101,32 @@ type Registry interface {
 	PoolByID(ctx context.Context, id domain.PoolID) (domain.Pool, error)
 }
 
-// Opener opens the *pgxpool.Pool backing p. NewOpener builds the
-// production implementation; tests substitute a fake that never dials a
-// real network.
-type Opener func(ctx context.Context, p domain.Pool) (*pgxpool.Pool, error)
+// Opener opens the *pgxpool.Pool backing p, connecting as cred. NewOpener
+// builds the production implementation; tests substitute a fake that never
+// dials a real network.
+//
+// cred is whatever Options.Credentials issued for p, and the zero
+// Credential means "connect as p.MetadataDSN already says" — which is the
+// default and was the only behaviour before this parameter existed. An
+// implementation that ignores cred silently connects on the pool row's
+// long-lived credential while this resolver schedules retirements against
+// an issued one it is not using, so an Opener must apply it: pass it to
+// pg.OpenAs, which is the one function here that knows how.
+type Opener func(ctx context.Context, p domain.Pool, cred domain.Credential) (*pgxpool.Pool, error)
 
-// NewOpener returns the production Opener: it hands p.MetadataDSN straight
-// to pg.Open with cfg and does nothing else with it.
+// NewOpener returns the production Opener: it hands p.MetadataDSN and cred
+// straight to pg.OpenAs with cfg and does nothing else with either.
 //
 // Doing nothing else is the contract, not an implementation detail.
-// pg.Open is the one function audited never to let a DSN's text reach a
-// returned error (see its doc comment); parsing, validating or wrapping
-// the DSN here would reopen exactly that leak in this package instead. See
+// pg.OpenAs is the one function audited never to let a DSN's text reach a
+// returned error (see its doc comment), and the one place that applies a
+// credential to an already-parsed configuration rather than by rewriting a
+// connection string; parsing, validating or interpolating either of them
+// here would reopen exactly those leaks in this package instead. See
 // TestResolve_NeverLeaksMetadataDSN.
 func NewOpener(cfg pg.PoolConfig) Opener {
-	return func(ctx context.Context, p domain.Pool) (*pgxpool.Pool, error) {
-		return pg.Open(ctx, p.MetadataDSN, cfg)
+	return func(ctx context.Context, p domain.Pool, cred domain.Credential) (*pgxpool.Pool, error) {
+		return pg.OpenAs(ctx, p.MetadataDSN, cred, cfg)
 	}
 }
 
@@ -141,6 +172,38 @@ type Options struct {
 	// that a consumer runs should not spend wall-clock time proving that a
 	// TTL elapses. A test pins an instant and advances it.
 	Clock domain.Clock
+
+	// Credentials issues the credential each pool's connections
+	// authenticate with. Nil means domain.StaticDSNCredentials — connect
+	// as the pool row's MetadataDSN says, and never retire a pool for
+	// credential age — which is this module's default and what every
+	// deployment that sets nothing gets.
+	//
+	// A Credentials that issues expiring credentials requires
+	// LongestTransaction to be set. See credentials/openbao.
+	Credentials domain.Credentials
+
+	// LongestTransaction is the longest a single transaction on a tenant
+	// pool may run, and it is required whenever Credentials issues
+	// credentials that expire.
+	//
+	// It is the lead time a pool is retired by: a pool built on a
+	// credential expiring at T stops being handed to new callers at T
+	// minus this, and the transactions already running on it have until T
+	// to finish. That window is a drain window, not a safety margin, so
+	// the number is a fact about this deployment's slowest query rather
+	// than a security preference — and getting it wrong in the small
+	// direction is not a slow query, it is a transaction that loses its
+	// privileges mid-statement and a COMMIT that silently becomes a
+	// ROLLBACK (see poolEntry.retireAt).
+	//
+	// It is validated against what is actually issued, not only at
+	// configuration time: a credential whose whole lifetime is less than
+	// twice this is refused at resolution with domain.ErrInvalidConfig,
+	// because a pool retired that early would spend more of its life
+	// draining than serving. The error names both numbers and the floor —
+	// see openNewPool.
+	LongestTransaction time.Duration
 }
 
 // DefaultMaxTenants is used for Options.MaxTenants when it is zero or
@@ -184,8 +247,10 @@ const DefaultMaxTenants = 10_000
 type CachingResolver struct {
 	registry Registry
 	open     Opener
+	creds    domain.Credentials
 	ttl      time.Duration
 	negTTL   time.Duration
+	lead     time.Duration
 	clock    domain.Clock
 
 	tenantGroup singleflight.Group
@@ -211,11 +276,17 @@ func NewResolver(registry Registry, open Opener, opts Options) *CachingResolver 
 	if clock == nil {
 		clock = domain.SystemClock{}
 	}
+	creds := opts.Credentials
+	if creds == nil {
+		creds = domain.StaticDSNCredentials{}
+	}
 	return &CachingResolver{
 		registry:        registry,
 		open:            open,
+		creds:           creds,
 		ttl:             opts.TTL,
 		negTTL:          opts.NegativeTTL,
+		lead:            opts.LongestTransaction,
 		clock:           clock,
 		positiveTenants: newLRU[domain.TenantID, *positiveTenantEntry](maxTenants),
 		negativeTenants: newLRU[domain.TenantID, *negativeTenantEntry](maxTenants),
@@ -390,13 +461,27 @@ func (r *CachingResolver) resolveHandle(ctx context.Context, tenant domain.Tenan
 // pools.get should never find a closed entry still sitting in the cache.
 // It costs nothing to check anyway, and documents the invariant.
 func (r *CachingResolver) getAndBorrow(poolID domain.PoolID) (*poolEntry, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	now := r.clock.Now()
 
+	r.mu.Lock()
 	entry, ok := r.pools.get(poolID)
 	if !ok || entry.closed {
+		r.mu.Unlock()
 		return nil, false
 	}
+	// The one place credential-driven retirement enters: an entry whose
+	// credential is coming up for expiry stops being handed out here, and
+	// the caller's ensurePool loop opens its replacement on a fresh
+	// credential. Deliberately checked on the lookup path rather than from
+	// a timer — see the package doc comment for what that costs.
+	if retired, closeNow := r.retireIfDueLocked(poolID, entry, now); retired {
+		r.mu.Unlock()
+		if closeNow {
+			r.closeInBackground(entry)
+		}
+		return nil, false
+	}
+
 	if testHookDuringGetAndBorrow != nil {
 		// Test-only (see its own doc comment): lets a white-box test pause
 		// here, still holding r.mu, exactly where a prior, since-fixed
@@ -406,7 +491,33 @@ func (r *CachingResolver) getAndBorrow(poolID domain.PoolID) (*poolEntry, bool) 
 		testHookDuringGetAndBorrow()
 	}
 	entry.refs++
+	r.mu.Unlock()
 	return entry, true
+}
+
+// retireIfDueLocked retires entry if its credential's retirement is due,
+// removing it from the pool cache so no further caller can be handed it,
+// and reports whether it did and whether the caller must now close it.
+//
+// The caller must already hold r.mu, and must call closeInBackground(entry)
+// outside the lock when closeNow is true — the same contract retireLocked
+// has, for the same reason.
+//
+// An entry with no retireAt is never due: that is every pool connected on
+// its registry row's own DSN, which is the default, so this costs one
+// IsZero check on the hot resolution path and changes nothing for a
+// deployment that has not configured a credential issuer.
+func (r *CachingResolver) retireIfDueLocked(poolID domain.PoolID, entry *poolEntry, now time.Time) (retired, closeNow bool) {
+	if entry.retireAt.IsZero() || now.Before(entry.retireAt) {
+		return false, false
+	}
+	// Removing it from the cache here is what makes this a retirement
+	// rather than a leak: retireLocked drops the cache's own reference on
+	// the assumption that the cache no longer holds the entry, and an
+	// entry left in r.pools after that would be handed out with a
+	// reference count one lower than the number of holders.
+	r.pools.remove(poolID)
+	return true, r.retireLocked(entry)
 }
 
 // testHookDuringGetAndBorrow, when non-nil, is called by getAndBorrow
@@ -469,17 +580,33 @@ func (r *CachingResolver) openNewPool(ctx context.Context, poolID domain.PoolID)
 		if err != nil {
 			return nil, err
 		}
-		db, err := r.open(ctx, p)
+		cred, err := r.creds.Issue(ctx, p)
 		if err != nil {
 			return nil, err
 		}
+		retireAt, err := r.retirementInstant(cred)
+		if err != nil {
+			// The credential is unusable for this deployment, so it is
+			// handed straight back rather than left to expire on its own:
+			// an issuer that counts live credentials should not be made to
+			// count one this resolver refused to connect with.
+			_ = r.creds.Release(ctx, cred)
+			return nil, err
+		}
+		db, err := r.open(ctx, p, cred)
+		if err != nil {
+			_ = r.creds.Release(ctx, cred)
+			return nil, err
+		}
 
-		entry := &poolEntry{pool: p, db: db, refs: 1} // cache's own reference
+		// refs starts at 1: the cache's own reference.
+		entry := &poolEntry{pool: p, db: db, cred: cred, retireAt: retireAt, refs: 1}
 
 		r.mu.Lock()
 		if r.closed {
 			r.mu.Unlock()
 			db.Close()
+			_ = r.creds.Release(ctx, cred)
 			return nil, errResolverClosed
 		}
 		// put's eviction decision and retireLocked's state update (marking
@@ -499,11 +626,63 @@ func (r *CachingResolver) openNewPool(ctx context.Context, poolID domain.PoolID)
 		r.mu.Unlock()
 
 		if wasEvicted && shouldCloseEvicted {
-			closeInBackground(evicted.db)
+			r.closeInBackground(evicted)
 		}
 		return nil, nil
 	})
 	return err
+}
+
+// retirementInstant returns when a pool opened on cred must stop being
+// handed to new callers, or the zero time for a credential that does not
+// expire — which is the default and costs nothing.
+//
+// It is also where the one configuration constraint this feature adds is
+// enforced, against what was actually issued rather than against what was
+// configured. Two things have to hold, and both are refused here rather
+// than discovered later as a 42501 in a caller's transaction:
+//
+//   - LongestTransaction must be set at all. There is no defensible
+//     default: the number is a fact about the deployment's slowest query,
+//     and a library guessing it would be guessing how long another
+//     system's transactions run.
+//   - The credential must have at least twice that long left to live. The
+//     lead time is a drain window, so a credential with less than two
+//     lead times remaining would produce a pool that spends more of its
+//     life draining than serving — and one with less than one lead time
+//     remaining would have to be retired before it was opened.
+//
+// Both report domain.ErrInvalidConfig, naming both numbers and the floor,
+// because both are a deployment mistake that retrying cannot fix: the
+// issuing role's TTL is what has to change.
+func (r *CachingResolver) retirementInstant(cred domain.Credential) (time.Time, error) {
+	if !cred.Expires() {
+		return time.Time{}, nil
+	}
+	if r.lead <= 0 {
+		return time.Time{}, fmt.Errorf(
+			"%w: a credential was issued that expires, but LongestTransaction is not set: "+
+				"a pool on an expiring credential has to be retired early enough for the transactions "+
+				"already running on it to finish, and this module cannot guess how long that is — "+
+				"set it to the longest transaction this deployment serves",
+			domain.ErrInvalidConfig)
+	}
+
+	remaining := cred.ExpiresAt.Sub(r.clock.Now())
+	if remaining < 2*r.lead {
+		return time.Time{}, fmt.Errorf(
+			"%w: the credential issued for this pool has %s left to live, but LongestTransaction is %s: "+
+				"a pool stops being handed to new callers %s before its credential expires so that the "+
+				"transactions already running on it can finish, because a transaction still open at expiry "+
+				"loses its privileges mid-statement (SQLSTATE 42501) and its COMMIT then silently becomes a "+
+				"ROLLBACK — so a credential issued for less than twice that would spend more of its life "+
+				"draining than serving. Raise the issuing role's TTL to at least %s, or lower "+
+				"LongestTransaction to at most %s",
+			domain.ErrInvalidConfig, remaining.Round(time.Second), r.lead, r.lead,
+			(2 * r.lead), (remaining / 2).Round(time.Second))
+	}
+
+	return cred.ExpiresAt.Add(-r.lead), nil
 }
 
 // borrow schedules the release of entry's already-reserved reference (see
@@ -537,7 +716,7 @@ func (r *CachingResolver) release(entry *poolEntry) {
 	r.mu.Unlock()
 
 	if shouldClose {
-		closeInBackground(entry.db)
+		r.closeInBackground(entry)
 	}
 }
 
@@ -576,15 +755,59 @@ func (r *CachingResolver) retireLocked(entry *poolEntry) (shouldCloseNow bool) {
 	return false
 }
 
-// closeInBackground closes db on a dedicated goroutine rather than the
-// caller's, since *pgxpool.Pool.Close can block waiting for a connection
-// some unrelated goroutine still has checked out (see retireLocked's doc
-// comment). Used for the eviction and release paths that run on a request
+// closeInBackground closes entry's pool, and then hands its credential
+// back, on a dedicated goroutine rather than the caller's — since
+// *pgxpool.Pool.Close can block waiting for a connection some unrelated
+// goroutine still has checked out (see retireLocked's doc comment). Used
+// for the eviction, retirement and release paths that run on a request
 // goroutine; Close itself stays synchronous (see its own doc comment for
 // why that is a deliberate difference, not an oversight).
-func closeInBackground(db *pgxpool.Pool) {
-	go db.Close()
+//
+// The order is forced: the credential is released only after the pool is
+// actually closed, because releasing it first would revoke the login under
+// connections still finishing their work — which is precisely the
+// mid-transaction 42501 this whole arrangement exists to avoid.
+func (r *CachingResolver) closeInBackground(entry *poolEntry) {
+	go func() {
+		entry.db.Close()
+		r.releaseCredential(entry.cred)
+	}()
 }
+
+// releaseCredential hands cred back to whatever issued it, and discards the
+// error.
+//
+// Discarding it is deliberate and is the honest shape rather than a
+// swallowed failure. There is no caller to report it to — this runs after
+// the last borrower's context has already finished — and this module has no
+// logger to report it through; adding one so that a best-effort cleanup
+// could complain would put a logging decision into every consumer of a
+// library whose job is to be boring. An implementation that needs a failed
+// release to be visible reports it itself, which is why the port says so.
+//
+// Nothing depends on it succeeding, either. A credential this resolver
+// stops using expires on its own schedule, and Postgres enforces VALID
+// UNTIL independently of whether the issuer's revocation worked — measured,
+// and the one backstop in this arrangement that always holds. Releasing is
+// an optimization that returns the credential early and keeps the number of
+// live logins bounded by what is in use rather than by what has ever been
+// issued.
+func (r *CachingResolver) releaseCredential(cred domain.Credential) {
+	if cred.IsZero() {
+		return
+	}
+	// A context of its own: the caller's is long gone by now, and a
+	// release that inherited a cancelled context would never be attempted.
+	ctx, cancel := context.WithTimeout(context.Background(), credentialReleaseTimeout)
+	defer cancel()
+	_ = r.creds.Release(ctx, cred)
+}
+
+// credentialReleaseTimeout bounds one best-effort credential release. It is
+// short because nothing waits on the result and the credential expires
+// anyway; it exists so that an unreachable issuer leaks a goroutine for
+// seconds rather than for the life of the process.
+const credentialReleaseTimeout = 10 * time.Second
 
 // Close closes every *pgxpool.Pool this resolver has ever opened,
 // including ones already evicted from the cache but still awaiting a
@@ -628,6 +851,7 @@ func (r *CachingResolver) Close() error {
 
 		if !alreadyClosed {
 			entry.db.Close()
+			r.releaseCredential(entry.cred)
 		}
 	}
 	return nil

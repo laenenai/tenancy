@@ -22,15 +22,46 @@ import (
 // that never does — in that case the pool is conservatively kept open
 // rather than guessed to be safe to close.
 //
-// retired is set once the entry falls out of the LRU (evicted, or the
-// resolver closed). The underlying *pgxpool.Pool is only actually closed
-// once retired is true AND refs has dropped to zero: every ref — the
-// cache's own and every outstanding borrow — must be released first.
+// retired is set once the entry falls out of the LRU (evicted, the resolver
+// closed, or — see retireAt — its credential coming up for expiry). The
+// underlying *pgxpool.Pool is only actually closed once retired is true AND
+// refs has dropped to zero: every ref — the cache's own and every
+// outstanding borrow — must be released first.
 //
 // All fields are guarded by the owning CachingResolver's mutex.
 type poolEntry struct {
 	pool domain.Pool
 	db   *pgxpool.Pool
+
+	// cred is the credential this pool's connections authenticated with,
+	// kept so it can be handed back to whatever issued it once the pool is
+	// actually closed. It is the zero Credential for a pool connected on
+	// its registry row's own DSN, in which case there is nothing to hand
+	// back.
+	cred domain.Credential
+
+	// retireAt is when this entry stops being handed to new callers. It is
+	// the zero time for an entry that can only ever be retired by eviction
+	// or by Close, which is every entry whose credential does not expire.
+	//
+	// It is deliberately earlier than cred.ExpiresAt, by the lead time
+	// Options.LongestTransaction names, because a credential's expiry is
+	// neither a disconnect nor a clean cut-off. Measured (see
+	// docs/superpowers/spikes/2026-10-23-openbao-db-credentials.md): no
+	// connection closes and conn.IsClosed stays false, a transaction that
+	// already holds a lock on a relation keeps that relation's privileges
+	// until it ends — one scenario committed a write 16 seconds after its
+	// role was dropped — and a transaction that touches anything new fails
+	// with SQLSTATE 42501, poisons itself with 25P02, and then has its
+	// COMMIT silently turn into a ROLLBACK. That last outcome is a write
+	// the application believes succeeded.
+	//
+	// The gap between retireAt and cred.ExpiresAt is the window the
+	// refcount above has to drain in, and it is what prevents that
+	// outcome. Which is why the lead time is set by the slowest
+	// transaction a deployment serves rather than by a security
+	// preference. See CachingResolver.retireIfDueLocked.
+	retireAt time.Time
 
 	refs    int
 	retired bool
@@ -112,6 +143,21 @@ func (c *lru[K, V]) put(key K, val V) (evictedKey K, evictedVal V, ok bool) {
 	c.order.Remove(back)
 	delete(c.byKey, item.key)
 	return item.key, item.val, true
+}
+
+// remove drops key from the cache and reports whether it was there. Unlike
+// put's eviction it returns nothing: the caller already holds the value it
+// is removing, because the only reason to call this is that the caller has
+// just decided that value must stop being handed out (see
+// CachingResolver.retireIfDueLocked).
+func (c *lru[K, V]) remove(key K) bool {
+	elem, ok := c.byKey[key]
+	if !ok {
+		return false
+	}
+	c.order.Remove(elem)
+	delete(c.byKey, key)
+	return true
 }
 
 // all returns every value currently cached, most-recently-used first.

@@ -83,14 +83,43 @@ type Config struct {
 
 	// Opener, when non-nil, replaces how a pool's connection pool is
 	// opened. Zero means the production opener, which hands the pool row's
-	// MetadataDSN straight to pg.Open.
+	// MetadataDSN and the issued credential straight to pg.OpenAs.
 	//
 	// It is the seam a consumer that manages its own connections uses, and
 	// the seam this module's own tests use to assert pool lifecycle
 	// without a database. A consumer supplying one takes on the
 	// obligations pool.NewOpener's doc comment describes — in particular,
-	// that the DSN's text must never reach a returned error.
+	// that the DSN's text must never reach a returned error, and that the
+	// credential it is handed is the one it must connect with.
 	Opener pool.Opener
+
+	// Credentials, when non-nil, issues the credential each tenant pool's
+	// connections authenticate with, instead of connecting on the
+	// credential that pool's registry row already carries.
+	//
+	// Zero means domain.StaticDSNCredentials: every pool connects as its
+	// MetadataDSN says and no pool is ever retired for credential age.
+	// That is this module's default and is unchanged from before this
+	// field existed — a deployment that wants nothing to change sets
+	// nothing.
+	//
+	// The shipping alternative is credentials/openbao, which issues a
+	// per-pool credential from OpenBao's database secrets engine with a
+	// lease, and whose package doc comment is where the measurements and
+	// the operational requirements are written down. Setting this requires
+	// Cache.LongestTransaction, because a credential that expires forces a
+	// decision about how long a transaction may run — see Open, which
+	// refuses the configuration rather than discovering it later.
+	//
+	// It applies to tenant pools only. The control plane's own pool and
+	// the migration pool keep their static DSNs, and that is a limit
+	// rather than an omission: neither of those is reference counted, so
+	// there is no moment at which replacing one is known to be safe. What
+	// the spike established about those two credentials is a property of
+	// the roles they name — members of an owning role, never superusers,
+	// which keeps even the control plane inside the fail-closed backstop —
+	// and Scoped.CheckEnforcement is what reports whether that holds.
+	Credentials domain.Credentials
 }
 
 // Tenancy is this module's one object: the control plane, the resolver,
@@ -126,6 +155,23 @@ func Open(ctx context.Context, cfg Config) (*Tenancy, error) {
 			domain.ErrInvalidConfig, cfg.AppRole)
 	}
 
+	if cfg.Credentials != nil && cfg.Cache.LongestTransaction <= 0 {
+		// Refused here rather than at the first resolution, because this
+		// is a wiring question with a wiring answer: a credential that
+		// expires means a pool has to be retired early enough for the
+		// transactions already running on it to drain, and nothing in this
+		// module can know how long that is. Getting it wrong in the small
+		// direction is not a slow query — it is a transaction that loses
+		// its privileges mid-statement (SQLSTATE 42501) and a COMMIT that
+		// silently becomes a ROLLBACK, which is a write the application
+		// believes succeeded. See internal/pool's poolEntry.retireAt.
+		return nil, fmt.Errorf(
+			"%w: Cache.LongestTransaction is required when Credentials is set: it is the longest "+
+				"transaction this deployment serves, and a pool on an expiring credential is retired "+
+				"that long before the credential expires so its outstanding transactions can finish",
+			domain.ErrInvalidConfig)
+	}
+
 	clock := cfg.Clock
 	if clock == nil {
 		clock = domain.SystemClock{}
@@ -148,6 +194,9 @@ func Open(ctx context.Context, cfg Config) (*Tenancy, error) {
 	cache := cfg.Cache
 	if cache.Clock == nil {
 		cache.Clock = clock
+	}
+	if cache.Credentials == nil {
+		cache.Credentials = cfg.Credentials
 	}
 
 	return &Tenancy{
@@ -214,8 +263,8 @@ func (t *Tenancy) Close() error {
 // a glance which containers are safe by construction. See CONVENTIONS.md's
 // "Rendering a secret".
 func (cfg Config) String() string {
-	return fmt.Sprintf("tenancy.Config{RegistryDSN: %s, AppRole: %q, Postgres: %+v, Cache: %+v, Clock: %T, Opener: %s}",
-		cfg.RegistryDSN, cfg.AppRole, cfg.Postgres, cfg.Cache, cfg.Clock, openerDescription(cfg.Opener))
+	return fmt.Sprintf("tenancy.Config{RegistryDSN: %s, AppRole: %q, Postgres: %+v, Cache: %+v, Clock: %T, Opener: %s, Credentials: %T}",
+		cfg.RegistryDSN, cfg.AppRole, cfg.Postgres, cfg.Cache, cfg.Clock, openerDescription(cfg.Opener), cfg.Credentials)
 }
 
 // Format implements fmt.Formatter, the only interface fmt consults for every
@@ -233,6 +282,11 @@ func (cfg Config) LogValue() slog.Value {
 		slog.String("app_role", cfg.AppRole),
 		slog.String("clock", fmt.Sprintf("%T", cfg.Clock)),
 		slog.String("opener", openerDescription(cfg.Opener)),
+		// The type name, not the value: a Credentials implementation holds
+		// the material it authenticates to its issuer with, and %T is the
+		// one rendering that reaches no interface and discloses nothing
+		// (CONVENTIONS.md's "Rendering a secret").
+		slog.String("credentials", fmt.Sprintf("%T", cfg.Credentials)),
 	)
 }
 
