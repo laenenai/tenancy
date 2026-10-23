@@ -277,7 +277,9 @@ code; `cas` pins 1.31.1. Converging is a deliberate one-commit bump across
   branch on adapter-specific shapes.
 - Wrap with `%w`. `errorlint` is on. Compare with `errors.Is`/`errors.As`.
 - **Never put sensitive payload in an error or a log line.** State the
-  invariant in the package doc and test it in the suite.
+  invariant in the package doc and test it in the suite. The mechanism is in
+  **Rendering a secret** below: the redaction lives on the type that holds the
+  material, not at the call site that happens to print it.
 
 ## Documentation
 
@@ -305,3 +307,248 @@ code; `cas` pins 1.31.1. Converging is a deliberate one-commit bump across
   surface** even though Go's internal rule keeps the import path private. A
   generator listing only importable packages reports an incomplete surface —
   converting `meter` took its golden file from 76 lines to 261.
+
+## Rendering a secret: redaction belongs on the type
+
+Decided 2026-10-23. **There is deliberately no logging module, and no logger
+that scrubs.** Redaction is a property of the type that holds the material, not
+of the sink the material happens to reach.
+
+The reason is the failure mode. A scrubbing logger covers the call sites that
+go through the logger. It does not cover `fmt.Errorf("open %s: %w", dsn, err)`
+in the one error path nobody tested, `fmt.Sprintf("%+v", cfg)` in a panic
+message, `json.Marshal` of a config struct in a debug endpoint, or a `%v` that
+a third-party library applies to something it was handed. A convention that
+only covers `slog` is a convention that leaks through `fmt.Printf` — and it
+leaks exactly once, in the path that only runs when something is already going
+wrong, which is also the path whose output someone pastes into an issue.
+
+So: **a type that holds security-relevant material is responsible for
+rendering itself safely in every way Go can render it.** The material is
+unexported, and every rendering yields a fixed placeholder.
+
+### The four interfaces, and what each one actually controls
+
+| Rendering | Interface that controls it |
+|---|---|
+| `%v`, `%s`, `%q`, `%x`, `%X`, `print`, `String()` concatenation | `fmt.Stringer` |
+| every other verb — `%d`, `%c`, `%U`, `%b`, `%o`, `%e`, `%f`, `%#v`, width/precision forms | `fmt.Formatter` |
+| `json.Marshal`, and everything built on it | `json.Marshaler` |
+| `slog` structured attributes, under every handler | `slog.LogValuer` |
+
+All four. Not a subset, and the subset is the trap — each of the following was
+measured on go1.25.6 rather than inferred, because the inference was wrong
+twice:
+
+- **`fmt.Stringer` covers more than `%v`, and much less than "formatting".**
+  `fmt` consults `Stringer` for `%v`, `%s`, `%q`, `%x` and `%X` only. For every
+  other verb it falls through to reflection and prints the *fields*. A `DEK`
+  carrying 32 bytes and implementing `Stringer`, `GoStringer`, `MarshalText`,
+  `MarshalJSON` and `LogValuer` — four of the interfaces, and the shape
+  `keyring` shipped — rendered under `%d` as
+  `{[115 117 112 51 114 115 51 99 ...]}`: the whole key, in decimal, because
+  `%d` consults none of them. `%c`, `%U`, `%b` and `%o` do the same in their
+  own alphabets.
+
+- **`fmt.GoStringer` does control `%#v`** — the earlier claim that only
+  `fmt.Formatter` can is wrong. But `GoStringer` is still not sufficient and
+  `Formatter` is still required, for the reason above rather than for `%#v`:
+  `Formatter` is the only interface `fmt` consults for *every* verb. A type
+  that implements `Formatter` needs no `GoStringer` at all; implement
+  `Formatter` and write the placeholder regardless of the verb, flags,
+  width and precision.
+
+- **`json.Marshal` ignores `Stringer` and `TextMarshaler`-for-`%v` alike**, and
+  a struct whose fields are all unexported encodes as `{}` — safe, but safe by
+  accident. The accident ends the moment a field is exported, or the type is a
+  named string or named `[]byte` rather than a struct: `type DSN string` with a
+  `String()` method marshals to `"postgres://u:pw@host/db"` verbatim.
+  `json.Marshaler` is what makes it deliberate.
+
+- **`slog` does not call `String()` in all cases.** `TextHandler` formats a
+  non-`LogValuer` attribute with `%+v`, so `Stringer` happens to save it.
+  `JSONHandler` calls `json.Marshal`, so `Stringer` does not: a named string
+  type with only a `String()` method logged as `slog.Any("dsn", dsn)` appeared
+  in the JSON line as its own value. `LogValuer` is what makes both handlers
+  safe, and it is consulted for `slog.Any`, for the `"key", value` variadic
+  form, and for a value nested inside a struct that is not itself a
+  `LogValuer`.
+
+### The one rendering no interface can control
+
+`%p`, and any other verb/operand mismatch that sends `fmt` down its bad-verb
+path, **bypasses every interface above**: `fmt` sets its internal `erroring`
+flag before describing the operand, and `handleMethods` returns immediately
+while erroring, so the operand is then reflected. Measured, with all four
+interfaces implemented:
+
+    %p on domain.DEK      =>  %!p(domain.DEK={[115 117 112 51 ...]})
+    %p on a named string  =>  %!p(tenancy.DSN=postgres://u:pw@host/db)
+
+There is a mitigation and it works: **hold the material behind a pointer
+field**, so the reflected form is an address rather than the bytes
+(`%!p(domain.DEK={0x14000012070})`). It is not mandated here, because a
+pointer field changes a value type's copy semantics and `keyring`'s `DEK`
+deliberately shares one backing array already. It is recorded so that the
+next person who finds `%p` in a log line knows it is a known, bounded hole
+rather than a missing method — and so that a *new* type holding material,
+which has no copy semantics to preserve yet, can close it for free.
+
+`%T` is the other verb that skips every interface, and it is the one that
+should: a type name is the diagnosable part.
+
+### Redaction is not inherited through an unexported field
+
+This is the one that cost the most to find, and it decides where the methods
+have to go.
+
+`fmt` can only call a method on a value it can hand out as an `any`, and a
+value reached through an **unexported** field fails `reflect.Value.CanInterface`.
+So `fmt` abandons the method path for that whole subtree and prints it by raw
+reflection. Measured, with a fully redacting `DSN` type:
+
+    Pool{ID, MetadataDSN DSN}        %+v =>  {ID:p-1 MetadataDSN:DSN(redacted)}
+    Scoped{poolRow Pool, role}       %+v =>  {poolRow:{ID:p-1 MetadataDSN:postgres://u:pw123@host/db} role:app}
+
+`tenancy.Scoped` is that second line: it holds its pool row, and therefore that
+pool's `MetadataDSN`, in an unexported field, and `%v`, `%+v`, `%#v`, `%s`,
+`%q`, `%d` and `slog`'s `TextHandler` all printed the password even though the
+`DSN` type redacts perfectly on its own.
+
+So: **every type that transitively holds material implements the four
+interfaces itself.** Giving the material its own redacting type is still worth
+doing — it makes the compiler carry the rule, and it protects every *exported*
+field for free, because `fmt` does consult an exported field's methods — but it
+protects nothing that is reached through an unexported field. The outer type
+needs its own methods.
+
+`json.Marshal` behaves the opposite way, and it is worth knowing which is
+which: it skips unexported fields entirely, so the struct that `fmt` renders
+most dangerously is the one `json` renders as `{}`.
+
+### The placeholder
+
+Every rendering yields **one fixed string, which names the type and contains
+nothing else**:
+
+    keyring.KEK(redacted)
+    tenancy.DSN(redacted)
+
+Two properties, both load-bearing:
+
+- **It identifies the type.** A log line reading `redacted` tells an operator
+  nothing; a log line reading `tenancy.DSN(redacted)` says what was at that
+  position, which is what makes the line diagnosable at all. The type is not
+  the secret.
+- **It carries no part of the material and no length.** Not a prefix, not a
+  last-four, not a fingerprint, and **not `len()`**. Length is a side channel,
+  and a cheap one for exactly the secrets that need protecting most: knowing a
+  password is 6 characters rather than 64 removes most of a search space, and
+  knowing a share or a seed is 16 bytes rather than 32 names the construction.
+  `%d bytes` on a secret is a disclosure that looks like diligence.
+
+  The distinction to hold onto is *material* versus *record about material*.
+  `keyring`'s `WrappedDEK.String` reports `ciphertext=%d bytes`, and that is
+  correct: the ciphertext is not a secret, the length of a wrapped-key blob is
+  a property of the adapter's format rather than of the key, and the KEK id,
+  version and key id it also prints are the whole reason those fields are
+  recorded. A type that prints a length must be able to say why that length is
+  public.
+
+### What counts as security-relevant material
+
+- Key material of any kind — DEKs, KEKs, root keys, derived keys, seeds.
+- Token bytes, signatures, MACs, and any assembled bearer credential.
+- Database DSNs and connection strings, and **any URL carrying userinfo**. A
+  DSN is the most likely real leak in this set, because it is the one secret
+  that is also a convenient diagnostic: it names a host and a database, so
+  there is a standing temptation to print it, and it carries a password.
+- Passwords, passphrases, API keys, client secrets, service-account JSON.
+- Share material and any threshold-scheme fragment (`escrow`).
+- Anything a module's `CHARTER.md` calls a secret. The charter is binding here
+  as everywhere else: if the charter says a value is secret, the type holding
+  it implements all four interfaces, and no further argument is needed.
+
+A plaintext payload is also covered, by the same rule under a different name —
+`cas`'s `NoPayloadContentLeaksInErrors` is this convention applied to content
+rather than to keys.
+
+### Errors from a security path
+
+The bullet in **Errors** above — never put sensitive payload in an error or a
+log line — has a second half that is easy to miss:
+
+- **An error must not interpolate the material.** This is not covered by the
+  four interfaces when the error is built from a *field* of the material
+  (`fmt.Errorf("connect to %s: %w", dsn.Host(), err)` is fine; passing the DSN
+  itself is fine too *once the type redacts*; passing `string(dsn)` defeats
+  both). Pass the typed value, never its primitive.
+- **An error must not name which check failed, when naming it hands an
+  attacker a dimension to search along.** `captoken` already decided this and
+  is the precedent to copy. `captoken/internal/caveat/caveat.go` declares:
+
+      // ErrCaveatNotSatisfied is returned by a caveat's Check method, and by
+      // CheckAll, when a request does not satisfy a token's caveats. It never
+      // names which caveat failed, and never carries any value from the
+      // caveat or the request: a verifier that explains why a request was
+      // refused hands an attacker a dimension to search along.
+      //
+      // Nothing wraps it with further detail. That is not an oversight to be
+      // tidied up later — a wrapped cause is an oracle, and the one place a
+      // refusal's reason may be recorded is the issuer's own logs, never the
+      // value handed back across the trust boundary.
+
+  and `caveat_test.go`'s `TestCaveats_NeverLeakSecretValues` asserts not only
+  that the error omits the sentinel value but that it does not name the caveat
+  *kind*, "which is itself a dimension to search along". Sixteen caveat types
+  return one indistinguishable sentinel on purpose.
+
+  The rule is not "errors must be unhelpful". It is that the detail belongs on
+  the side that already knows the secret: the issuer's or the operator's own
+  logs, at the point of decision, never in the value returned across the trust
+  boundary. Where a module needs both, it returns the opaque sentinel and logs
+  the specific reason itself.
+
+### Enforcement: a named subtest and a lint
+
+Two mechanisms, because they catch different mistakes.
+
+**`NoSecretLeaksInAnyRendering`** is a named subtest, in the same spirit as
+`cas`'s `NoPayloadContentLeaksInErrors`: it takes a value and the material that
+must not appear, and asserts that none of the five renderings — `String()`,
+every `fmt` verb, `json.Marshal`, `slog` under both stdlib handlers — contains
+the material, any encoding of it (hex, base64 std and url, Go quoted-string
+escaping), or its length in decimal. It also asserts the value implements all
+four interfaces, so a type that passes only because its material happens to be
+unreachable by reflection today still fails.
+
+**It is duplicated per module rather than shared, deliberately.** This is the
+`CanonicalTime` rule applied again: cross-module test helpers would make
+`keyringtest` — a *non-test* package, in the production import graph of
+everyone who imports it — depend on another module, coupling release cycles and
+pulling that module's own graph into every consumer's `go.sum` for the sake of
+an assertion about string containment. So it is the same function with the same
+self-test in every module that holds material, copied rather than imported, in
+that module's existing sibling `<module>test` package. It ships with its own
+negative fixture — a type that leaks under one verb, asserted to fail — so a
+copy that drops an encoding is caught where it was dropped.
+
+A module that holds no security-relevant material does not get a copy, and
+says so rather than inventing a test. `audit` and `meter` are in that position:
+a hash-chain digest commits to content that is already stored, and an
+idempotency key is derived from non-secret inputs. Neither is a secret, and
+treating them as one would make the convention mean less.
+
+**`redactlint`** (`github.com/laenenai/redactlint`) is the `go/analysis`
+analyzer that catches the types nobody remembered to register a subtest for. It
+flags a struct with an unexported `string`, `[]byte`, or named-over-either
+field whose name matches a configurable secret-ish pattern, and reports
+precisely which of the four interfaces is missing. An explicit marker comment
+on the field opts out and must state why:
+
+    //redact:plain — the key id, not the key
+    keyID string
+
+It is its own module because putting `golang.org/x/tools` into a library's
+module graph for every downstream consumer, to ship a lint, is not a trade any
+of these modules should make.
