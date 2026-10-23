@@ -124,6 +124,13 @@ type renderingLeak struct {
 type rendering struct {
 	name string
 	out  string
+	// direct is true when this rendering is of the subject itself rather
+	// than of a struct that merely contains it. Only direct renderings are
+	// held to the positive marker assertion: a containing struct whose
+	// field is unexported marshals to "{}" and is reached by fmt without
+	// the method path at all, so requiring a marker there would fail types
+	// that are in fact correct.
+	direct bool
 }
 
 // leakVerbs is every fmt verb this subtest exercises. %T and %p are absent on
@@ -154,6 +161,61 @@ func renderingLeaks(v any, material []byte) []renderingLeak {
 	return leaks
 }
 
+// redactionMarkerSubstring is what every direct rendering of a
+// material-bearing type must contain, case-insensitively. The placeholders in
+// this module set are "[REDACTED]" and "(redacted)"; both contain it, and a
+// third spelling someone invents almost certainly will too.
+const redactionMarkerSubstring = "redact"
+
+// RendersOnlyARedactionMarker is the positive half of the rendering
+// discipline, and it is separate from NoSecretLeaksInAnyRendering because it
+// is true of fewer types.
+//
+// It registers itself as a subtest of that name and asserts that every direct
+// rendering of v contains a redaction marker. Use it for a type whose entire
+// value is material — a DSN, a key, a credential, a share. Such a type has
+// nothing to render but the marker, and the negative assertion alone accepts
+// the wrong reasons for passing: a struct whose material sits in an
+// unexported field marshals to "{}", which discloses nothing and is also
+// indistinguishable from a type that holds nothing at all.
+//
+// Do NOT use it for a composite that renders a summary with the material left
+// out. tenancy.Scoped prints its tenant, pool and app role and simply does not
+// print the DSN it can reach; omission is the correct redaction there, and
+// requiring "[REDACTED]" in that line would add noise at no position where a
+// reader would otherwise wonder what was hidden.
+//
+// escrow's hand-written predecessor to the shared subtest made exactly this
+// assertion, over exactly this kind of type — SealedKey and Share — and
+// adopting the shared copy lost it. This is it back, at the right scope.
+func RendersOnlyARedactionMarker(t *testing.T, v any) {
+	t.Helper()
+
+	t.Run("RendersOnlyARedactionMarker", func(t *testing.T) {
+		for _, r := range unmarkedRenderings(v) {
+			t.Errorf("%s of %T is %q, which carries no redaction marker: "+
+				"a type whose whole value is material must say that it is redacting one, "+
+				"or a reader cannot tell a redacted secret from an absent field",
+				r.name, v, r.out)
+		}
+	})
+}
+
+// unmarkedRenderings reports the direct renderings of v that carry no
+// redaction marker.
+func unmarkedRenderings(v any) []rendering {
+	var bare []rendering
+	for _, r := range renderings(v) {
+		if !r.direct {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(r.out), redactionMarkerSubstring) {
+			bare = append(bare, r)
+		}
+	}
+	return bare
+}
+
 // renderings produces every rendering of v this subtest asserts on. Each verb
 // is applied both to v and to a struct that merely contains v, because that
 // second shape — a config, a handle, a request context that happens to carry
@@ -171,16 +233,16 @@ func renderings(v any) []rendering {
 
 	out := make([]rendering, 0, 2*len(leakVerbs)+10)
 	if s, ok := v.(fmt.Stringer); ok {
-		out = append(out, rendering{"String()", s.String()})
+		out = append(out, rendering{name: "String()", out: s.String(), direct: true})
 	}
 	for _, verb := range leakVerbs {
 		out = append(out,
-			rendering{"fmt " + verb, fmt.Sprintf(verb, v)},
-			rendering{"fmt " + verb + " of a struct holding it", fmt.Sprintf(verb, held)},
+			rendering{name: "fmt " + verb, out: fmt.Sprintf(verb, v), direct: true},
+			rendering{name: "fmt " + verb + " of a struct holding it", out: fmt.Sprintf(verb, held)},
 		)
 	}
 
-	out = append(out, marshalRendering("json.Marshal", v), marshalRendering("json.Marshal of a struct holding it", held))
+	out = append(out, marshalRendering("json.Marshal", v, true), marshalRendering("json.Marshal of a struct holding it", held, false))
 
 	// The timestamp is dropped from both handlers. It is not part of what is
 	// being asserted, and a time of day is a long run of digits that the
@@ -211,13 +273,13 @@ func renderings(v any) []rendering {
 		} {
 			var buf strings.Builder
 			slog.New(h.make(&buf)).Info("rendering", form.attr())
-			out = append(out, rendering{h.name + " " + form.name, buf.String()})
+			out = append(out, rendering{name: h.name + " " + form.name, out: buf.String()})
 		}
 		// The variadic "key", value form takes a different path through
 		// slog than slog.Any does, so it gets its own rendering.
 		var buf strings.Builder
 		slog.New(h.make(&buf)).Info("rendering", "value", v)
-		out = append(out, rendering{h.name + " key/value pair", buf.String()})
+		out = append(out, rendering{name: h.name + " key/value pair", out: buf.String()})
 	}
 
 	return out
@@ -226,32 +288,72 @@ func renderings(v any) []rendering {
 // marshalRendering renders v as JSON, keeping the error text as the rendering
 // when marshalling fails: a MarshalJSON that refuses by returning an error
 // built from the material would otherwise hide the leak in the error.
-func marshalRendering(name string, v any) rendering {
+func marshalRendering(name string, v any, direct bool) rendering {
 	b, err := json.Marshal(v)
 	if err != nil {
-		return rendering{name + " (error)", err.Error()}
+		return rendering{name: name + " (error)", out: err.Error(), direct: direct}
 	}
-	return rendering{name, string(b)}
+	return rendering{name: name, out: string(b), direct: direct}
 }
+
+// lengthWords are the words that make a bare number mean "this is how long
+// the secret is". The length needle only fires when one of them is nearby.
+//
+// "cap" is deliberately absent: a field named WorkerCapacity would match it
+// as a substring, and a pool's capacity is not a secret's length.
+var lengthWords = []string{"len", "length", "size", "bytes", "byte"}
+
+// lengthWindow is how far either side of the number one of lengthWords may
+// be. Wide enough for `[]uint8(len=32)` and `redacted, 32 bytes`, narrow
+// enough that an unrelated word elsewhere in the line does not qualify.
+const lengthWindow = 14
 
 // needle is one encoding of the material, as it would appear in a rendering.
 type needle struct {
 	what string
 	text string
-	// standalone is set for the length needle, where a bare number must be
-	// matched only as its own token. Two false positives it rules out, both
-	// real: a ciphertext byte count of 320 does not disclose a 32-byte key,
-	// and a ULID — which every id in these modules is — is a long run of
-	// letters and digits in which any two-digit number is near certain to
-	// appear.
-	standalone bool
+	// qualified is set for the length needle, where the text is a bare
+	// number. Such a needle fires only as its own token AND with one of
+	// lengthWords inside lengthWindow characters.
+	//
+	// The token rule alone rules out two real false positives: a ciphertext
+	// byte count of 320 does not disclose a 32-byte key, and a ULID — which
+	// every id in these modules is — is a long run of letters and digits in
+	// which any two-digit number is near certain to appear.
+	//
+	// The nearby-word rule exists because the token rule was not enough, and
+	// it was not enough in production rather than in theory. A Credential
+	// rendering its expiry as 2026-10-23T15:20:08Z contains a standalone 20
+	// between two colons, so a 20-byte secret — OpenBao's default password
+	// length — failed this subtest at 15:20 and passed at 15:21. A security
+	// test that fails by the clock gets deleted by whoever is on call.
+	//
+	// What this gives up: a length printed with no label at all, as `{32}`
+	// from %d on a struct holding only a length. That is a real but weak
+	// disclosure — a bare number in a rendering does not announce what it
+	// measures — and the trade buys a subtest that does not flake.
+	qualified bool
+}
+
+// nearLengthWord reports whether one of lengthWords appears within
+// lengthWindow characters of s[start:end], case-insensitively.
+func nearLengthWord(s string, start, end int) bool {
+	lo := max(0, start-lengthWindow)
+	hi := min(len(s), end+lengthWindow)
+	window := strings.ToLower(s[lo:hi])
+	for _, w := range lengthWords {
+		if strings.Contains(window, w) {
+			return true
+		}
+	}
+	return false
 }
 
 func (n needle) contained(s string) bool {
 	if n.text == "" {
 		return false
 	}
-	if !n.standalone {
+	if !n.qualified {
 		return strings.Contains(s, n.text)
 	}
 	for i := 0; ; {
@@ -262,7 +364,7 @@ func (n needle) contained(s string) bool {
 		start, end := i+j, i+j+len(n.text)
 		beforeOK := start == 0 || !isAlphanumeric(s[start-1])
 		afterOK := end == len(s) || !isAlphanumeric(s[end])
-		if beforeOK && afterOK {
+		if beforeOK && afterOK && nearLengthWord(s, start, end) {
 			return true
 		}
 		i = start + 1
@@ -288,7 +390,7 @@ func leakNeedles(material []byte) []needle {
 		{what: "base64 (std, unpadded)", text: base64.RawStdEncoding.EncodeToString(material)},
 		{what: "base64 (url)", text: base64.URLEncoding.EncodeToString(material)},
 		{what: "base64 (url, unpadded)", text: base64.RawURLEncoding.EncodeToString(material)},
-		{what: "its length in decimal", text: strconv.Itoa(len(material)), standalone: true},
+		{what: "its length in decimal", text: strconv.Itoa(len(material)), qualified: true},
 	}
 
 	// Go quoted-string escaping, as %q and encoding/json produce it. Only
