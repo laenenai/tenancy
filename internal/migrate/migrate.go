@@ -46,8 +46,11 @@ package migrate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 
 	"github.com/laenenai/pgmigrate"
 
@@ -96,7 +99,7 @@ type Config struct {
 	// credential by construction — see the package doc comment.
 	//
 	// Required.
-	DSN string
+	DSN domain.DSN
 
 	// AppRole is the Postgres role the control plane and every resolved
 	// pool connect as at run time. Up ensures it exists as a NOLOGIN role
@@ -175,14 +178,42 @@ func Status(ctx context.Context, cfg Config) ([]Applied, error) {
 }
 
 // resolvedConfig is Config validated, so nothing downstream re-checks it.
+//
+// It carries the migration DSN in an unexported field, which is the shape fmt
+// renders most dangerously: a value reached through an unexported field fails
+// reflect.Value.CanInterface, so fmt abandons the method path for the whole
+// subtree and prints it by raw reflection — domain.DSN's own redaction
+// included. The four methods below are why it does not. See CONVENTIONS.md's
+// "Rendering a secret"; redactlint reports exactly this shape.
 type resolvedConfig struct {
-	dsn      string
+	dsn      domain.DSN
 	appRole  string
 	postgres pg.PoolConfig
 }
 
+// String names the application role and redacts the migration credential.
+func (c resolvedConfig) String() string {
+	return fmt.Sprintf("migrate.resolvedConfig{dsn: %s, appRole: %q, postgres: %+v}",
+		c.dsn, c.appRole, c.postgres)
+}
+
+// Format implements fmt.Formatter, the only interface fmt consults for every
+// verb.
+func (c resolvedConfig) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, c.String()) }
+
+// MarshalJSON renders the same summary as a JSON string.
+func (c resolvedConfig) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// LogValue renders it as a slog group with the credential redacted.
+func (c resolvedConfig) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("dsn", domain.Redacted),
+		slog.String("app_role", c.appRole),
+	)
+}
+
 func (c Config) resolve() (resolvedConfig, error) {
-	if c.DSN == "" {
+	if c.DSN.IsZero() {
 		return resolvedConfig{}, fmt.Errorf(
 			"%w: migrate: DSN is required: it is the migration credential, which is deliberately not the runtime one",
 			domain.ErrInvalidConfig)
@@ -278,4 +309,29 @@ func mapErr(what string, err error) error {
 	default:
 		return fmt.Errorf("%w: %s: %w", domain.ErrUnavailable, what, err)
 	}
+}
+
+// String names the migration configuration's non-credential fields and
+// redacts its DSN. A migration credential is the strongest credential this
+// module is ever handed, so the configuration carrying it must not render it
+// — see CONVENTIONS.md's "Rendering a secret".
+func (c Config) String() string {
+	return fmt.Sprintf("tenancy.MigrateConfig{DSN: %s, AppRole: %q, Postgres: %+v}",
+		c.DSN, c.AppRole, c.Postgres)
+}
+
+// Format implements fmt.Formatter, the only interface fmt consults for every
+// verb.
+func (c Config) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, c.String()) }
+
+// MarshalJSON renders the same summary as a JSON string.
+func (c Config) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// LogValue renders the configuration as a slog group with the migration DSN
+// redacted.
+func (c Config) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("dsn", domain.Redacted),
+		slog.String("app_role", c.AppRole),
+	)
 }

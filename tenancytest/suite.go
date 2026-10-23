@@ -61,7 +61,11 @@ package tenancytest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -82,7 +86,7 @@ type Deployment struct {
 	// that stands up its own tenant-scoped fixture tables.
 	//
 	// Required.
-	MigrationDSN string
+	MigrationDSN tenancy.DSN
 
 	// RuntimeDSN is the credential the control plane and the data plane
 	// connect on. Empty means "the same as MigrationDSN", which is the
@@ -92,7 +96,7 @@ type Deployment struct {
 	// runtime credential gets a stronger result out of this suite: the
 	// superuser-bypass control assertions become inapplicable and say so,
 	// because there is no bypass left to demonstrate.
-	RuntimeDSN string
+	RuntimeDSN tenancy.DSN
 
 	// AppRole is the role every data-plane transaction narrows itself into
 	// with SET LOCAL ROLE, and the role the registry's grants are asserted
@@ -104,6 +108,37 @@ type Deployment struct {
 	// assert.
 	AppRole string
 }
+
+// String names the deployment's application role and redacts both
+// credentials. A Deployment is what a harness builds and what a failing
+// factory is most likely to print. See CONVENTIONS.md's "Rendering a secret".
+func (d Deployment) String() string {
+	return fmt.Sprintf("tenancytest.Deployment{MigrationDSN: %s, RuntimeDSN: %s, AppRole: %q}",
+		d.MigrationDSN, d.RuntimeDSN, d.AppRole)
+}
+
+// Format implements fmt.Formatter, the only interface fmt consults for every
+// verb.
+func (d Deployment) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, d.String()) }
+
+// MarshalJSON renders the same summary as a JSON string.
+func (d Deployment) MarshalJSON() ([]byte, error) { return json.Marshal(d.String()) }
+
+// LogValue renders the deployment as a slog group with both credentials
+// redacted.
+func (d Deployment) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("migration_dsn", redactedPlaceholder),
+		slog.String("runtime_dsn", redactedPlaceholder),
+		slog.String("app_role", d.AppRole),
+	)
+}
+
+// redactedPlaceholder is the literal every rendering of a credential in this
+// package yields. It matches internal/domain's Redacted, which the suite
+// cannot import a second copy of without widening what this package depends
+// on.
+const redactedPlaceholder = "[REDACTED]"
 
 // RunTenancySuite runs the contract every `tenancy` deployment must
 // satisfy.
@@ -126,6 +161,7 @@ func RunTenancySuite(t *testing.T, newDeployment func(t *testing.T) Deployment) 
 	t.Run("SuspendedTenantIsRefusedAndNeverCached", testSuspendedTenantIsRefusedAndNeverCached(newDeployment))
 	t.Run("SecurityModeIsImmutableInTheSchema", testSecurityModeIsImmutable(newDeployment))
 	t.Run("AppRoleHoldsExactlyTheRegistryPrivileges", testAppRolePrivileges(newDeployment))
+	t.Run("RenderingsOfAResolvedScope", testRenderingsOfAResolvedScope(newDeployment))
 
 	// Pool and handle lifecycle: the bugs `cas` found, at the level a
 	// consumer can observe them.
@@ -196,7 +232,7 @@ func setup(t *testing.T, dep Deployment, cache tenancy.CacheOptions, appRole str
 		t.Fatal("tenancytest: Deployment.AppRole is required")
 	}
 	runtimeDSN := dep.RuntimeDSN
-	if runtimeDSN == "" {
+	if runtimeDSN.IsZero() {
 		runtimeDSN = dep.MigrationDSN
 	}
 
@@ -207,7 +243,7 @@ func setup(t *testing.T, dep Deployment, cache tenancy.CacheOptions, appRole str
 		t.Fatalf("tenancy.Migrate: %v", err)
 	}
 
-	admin, err := pgxpool.New(ctx, dep.MigrationDSN)
+	admin, err := pgxpool.New(ctx, string(dep.MigrationDSN))
 	if err != nil {
 		t.Fatalf("open the administrative pool: %v", err)
 	}
@@ -1169,7 +1205,7 @@ func defaultCache() tenancy.CacheOptions {
 	return tenancy.CacheOptions{TTL: time.Minute, NegativeTTL: time.Minute}
 }
 
-func (e *env) runtimeDSN() string {
+func (e *env) runtimeDSN() tenancy.DSN {
 	if e.dep.RuntimeDSN != "" {
 		return e.dep.RuntimeDSN
 	}
@@ -1292,7 +1328,7 @@ func mustScope(ctx context.Context, t *testing.T, ten *tenancy.Tenancy, id tenan
 	return scoped
 }
 
-func mustCreatePool(ctx context.Context, t *testing.T, control *tenancy.Control, name, dsn string) tenancy.Pool {
+func mustCreatePool(ctx context.Context, t *testing.T, control *tenancy.Control, name string, dsn tenancy.DSN) tenancy.Pool {
 	t.Helper()
 	p, err := control.CreatePool(ctx, tenancy.NewPool{
 		Name:           name,
@@ -1353,10 +1389,10 @@ func waitUntilRefused(t *testing.T, scoped tenancy.Scoped) {
 // runtimeRoleIsSuperuser reports whether the role the runtime credential
 // connects as bypasses row security outright. It decides whether the
 // bypass-is-real control assertions apply.
-func runtimeRoleIsSuperuser(ctx context.Context, t *testing.T, admin *pgxpool.Pool, runtimeDSN string) bool {
+func runtimeRoleIsSuperuser(ctx context.Context, t *testing.T, admin *pgxpool.Pool, runtimeDSN tenancy.DSN) bool {
 	t.Helper()
 
-	cfg, err := pgxpool.ParseConfig(runtimeDSN)
+	cfg, err := pgxpool.ParseConfig(string(runtimeDSN))
 	if err != nil {
 		t.Fatal("parse the runtime dsn")
 	}
@@ -1471,6 +1507,48 @@ func testRLSAddedPermissivePolicyCannotWiden(newDeployment func(t *testing.T) De
 			t.Fatalf("with one extra permissive policy present, tenant A sees %d rows, want 1.\n"+
 				"the tenant predicate was OR-ed away rather than AND-ed: it must be "+
 				"AS RESTRICTIVE, with a permissive companion for it to AND against", count)
+		}
+	}
+}
+
+// testRenderingsOfAResolvedScope holds every value resolution hands back to
+// CONVENTIONS.md's "Rendering a secret" convention, against the deployment's
+// own real connection string rather than a fixture.
+//
+// It is in the suite rather than only in the module's unit tests because the
+// values under test are the ones a *deployment* produces: the pool row comes
+// out of that deployment's registry, and a consumer that supplies its own
+// Opener — the documented seam — is holding exactly these values. The unit
+// tests prove the types redact; this proves the deployment's own data does.
+//
+// The material is the deployment's migration DSN, which is also the DSN every
+// pool in this suite is registered with, so a rendering that discloses the
+// pool's credential and one that discloses the harness's are the same failure.
+func testRenderingsOfAResolvedScope(newDeployment func(t *testing.T) Deployment) func(*testing.T) {
+	return func(t *testing.T) {
+		dep := newDeployment(t)
+		e := setup(t, dep, defaultCache(), dep.AppRole, 0)
+		ctx := context.Background()
+
+		scoped, err := e.tenancy.Scope(ctx, e.tenantA.ID)
+		if err != nil {
+			t.Fatalf("Scope(tenantA): %v", err)
+		}
+
+		material := []byte(e.runtimeDSN())
+
+		for _, tc := range []struct {
+			name  string
+			value any
+		}{
+			{"Pool", e.poolA},
+			{"Scoped", scoped},
+			{"ScopedPool", scoped.Pool()},
+			{"Deployment", dep},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				NoSecretLeaksInAnyRendering(t, tc.value, material)
+			})
 		}
 	}
 }

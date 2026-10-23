@@ -172,6 +172,15 @@ type (
 type (
 	// TenantID identifies a tenant: the top-level unit of isolation.
 	TenantID = domain.TenantID
+	// DSN is a Postgres connection string. It is a distinct type because a
+	// DSN carries a password and is simultaneously the most tempting thing
+	// in this module to print: it redacts itself through fmt.Stringer,
+	// fmt.Formatter, json.Marshaler, encoding.TextMarshaler and
+	// slog.LogValuer, so reading the actual string requires writing
+	// string(dsn) — a deliberate, greppable act rather than the accidental
+	// default. See CONVENTIONS.md's "Rendering a secret".
+	DSN = domain.DSN
+
 	// PoolID identifies a pool: one physical Postgres database hosting the
 	// metadata of one or more tenants.
 	PoolID = domain.PoolID

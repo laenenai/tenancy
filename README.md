@@ -31,6 +31,15 @@ leak:
 The type system should make it impossible to run a data-plane query on a
 control-plane handle.
 
+A connection string is a credential, so `tenancy.DSN` is its own type rather
+than a `string`: it redacts itself through every rendering Go offers — `%v`,
+`%+v`, `%#v`, every other `fmt` verb, `json.Marshal`, and `slog` under both
+standard handlers — and reading the actual string requires writing
+`string(dsn)`, which is a deliberate act at a boundary rather than the
+accidental default. `Pool`, `Config`, `MigrateConfig`, `NewPool` and `Scoped`
+carry the same four methods, because a redacting field type protects a
+struct's *exported* fields and nothing reached through an unexported one.
+
 ## Why it is shared code rather than a convention
 
 Not to avoid duplication — because of blast radius. Postgres RLS here is a
@@ -48,7 +57,7 @@ query building, or any consuming system's domain concepts.
 ```go
 // Once, at startup, on the migration credential. The handle never escapes.
 if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{
-    DSN:     migrationDSN,
+    DSN:     tenancy.DSN(migrationDSN),
     AppRole: "myapp",
 }); err != nil {
     return err
@@ -56,7 +65,7 @@ if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{
 
 // For the life of the process, on the runtime credential.
 ten, err := tenancy.Open(ctx, tenancy.Config{
-    RegistryDSN: runtimeDSN,
+    RegistryDSN: tenancy.DSN(runtimeDSN),
     AppRole:     "myapp",
     Cache:       tenancy.CacheOptions{TTL: time.Minute, NegativeTTL: 10 * time.Second},
 })
@@ -67,7 +76,7 @@ defer ten.Close()
 
 // Control plane: the registry. No method here takes SQL.
 pool, err := ten.Control().CreatePool(ctx, tenancy.NewPool{
-    Name: "eu-main", Region: "eu-west-1", MetadataDSN: poolDSN,
+    Name: "eu-main", Region: "eu-west-1", MetadataDSN: tenancy.DSN(poolDSN),
 })
 
 // Data plane: one resolved tenant, with its session context already set.

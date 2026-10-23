@@ -34,7 +34,7 @@ import (
 // It is also the single clearest reason this module exists rather than
 // three copies of this code existing. Nobody re-derives this test.
 
-func toctouTestPool(id domain.PoolID, dsn string) domain.Pool {
+func toctouTestPool(id domain.PoolID, dsn domain.DSN) domain.Pool {
 	return domain.Pool{
 		ID:             id,
 		Name:           "pool-" + string(id),
@@ -78,7 +78,7 @@ func (f *toctouFakeRegistry) PoolByID(_ context.Context, id domain.PoolID) (doma
 }
 
 func toctouOpener(ctx context.Context, p domain.Pool) (*pgxpool.Pool, error) {
-	cfg, err := pgxpool.ParseConfig(p.MetadataDSN)
+	cfg, err := pgxpool.ParseConfig(string(p.MetadataDSN))
 	if err != nil {
 		return nil, err
 	}

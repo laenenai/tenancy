@@ -2,8 +2,11 @@ package pg
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -231,4 +234,42 @@ func (t TenantTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows,
 // QueryRow runs one single-row query in the tenant-scoped transaction.
 func (t TenantTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	return t.tx.QueryRow(ctx, sql, args...)
+}
+
+// String names the tenant, the pool and the application role, and redacts the
+// pool's MetadataDSN.
+//
+// This is the type that forced the rule. Scoped holds its pool row in an
+// *unexported* field, and a value reached through an unexported field fails
+// reflect.Value.CanInterface — so fmt cannot call a method on it, abandons
+// the method path for the whole subtree, and prints it by raw reflection,
+// domain.DSN's and domain.Pool's own redaction included. Measured before
+// these methods existed: %v, %+v, %#v, %s, %q, %d and slog's TextHandler all
+// printed the pool's password. A Scoped is the handle every data-plane
+// request holds, so it is also the value most likely to be logged. See
+// CONVENTIONS.md's "Rendering a secret".
+func (s Scoped) String() string {
+	return fmt.Sprintf("tenancy.Scoped{tenant: %s, pool: %s, appRole: %q}",
+		s.tenant.ID, s.poolRow.ID, s.appRole)
+}
+
+// Format implements fmt.Formatter, the only interface fmt consults for every
+// verb, and the one that matters most here: without it %#v reflected the
+// struct and printed the DSN as a quoted Go literal.
+func (s Scoped) Format(st fmt.State, _ rune) { _, _ = io.WriteString(st, s.String()) }
+
+// MarshalJSON renders the same summary as a JSON string. encoding/json skips
+// unexported fields, so a Scoped already marshalled to "{}" — safety by
+// accident, which ends the moment a field is exported.
+func (s Scoped) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) }
+
+// LogValue renders the handle as a slog group. slog's TextHandler formats a
+// non-LogValuer attribute with %+v, which is exactly the rendering that
+// leaked, so this is not redundant with String.
+func (s Scoped) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("tenant_id", string(s.tenant.ID)),
+		slog.String("pool_id", string(s.poolRow.ID)),
+		slog.String("app_role", s.appRole),
+	)
 }

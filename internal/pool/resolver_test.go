@@ -88,8 +88,8 @@ var _ pool.Registry = (*fakeRegistry)(nil)
 // pgxpool.ParseConfig accepts it (so countingOpener can build a real
 // *pgxpool.Pool), but pgxpool never dials until something acquires a
 // connection, so these tests never touch a real network.
-func fakeDSN(label string) string {
-	return "postgres://user:pass@127.0.0.1:1/" + label
+func fakeDSN(label string) domain.DSN {
+	return domain.DSN("postgres://user:pass@127.0.0.1:1/" + label)
 }
 
 func activeTenant(id domain.TenantID, poolID domain.PoolID) domain.Tenant {
@@ -103,7 +103,7 @@ func activeTenant(id domain.TenantID, poolID domain.PoolID) domain.Tenant {
 	}
 }
 
-func testPool(id domain.PoolID, dsn string) domain.Pool {
+func testPool(id domain.PoolID, dsn domain.DSN) domain.Pool {
 	return domain.Pool{
 		ID:             id,
 		Name:           "pool-" + string(id),
@@ -120,7 +120,7 @@ func testPool(id domain.PoolID, dsn string) domain.Pool {
 func countingOpener(calls *int32) pool.Opener {
 	return func(ctx context.Context, p domain.Pool) (*pgxpool.Pool, error) {
 		atomic.AddInt32(calls, 1)
-		cfg, err := pgxpool.ParseConfig(p.MetadataDSN)
+		cfg, err := pgxpool.ParseConfig(string(p.MetadataDSN))
 		if err != nil {
 			return nil, err
 		}
@@ -810,7 +810,7 @@ func TestResolve_NeverLeaksMetadataDSN(t *testing.T) {
 	const canary = "SUPERSECRET_POOL_DSN_CANARY" //nolint:gosec // canary value, not a real credential
 	cases := []struct {
 		name string
-		dsn  string
+		dsn  domain.DSN
 	}{
 		{"malformed DSN", "not-a-connection-string-at-all " + canary},
 		{"unreachable DSN", "postgres://alice:" + canary + "@127.0.0.1:1/tenancy"},
