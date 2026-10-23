@@ -245,7 +245,7 @@ func TestPoolRetiresBeforeItsLeaseExpiresAndInFlightWorkCommits(t *testing.T) {
 		t.Fatalf("read back the row written across the retirement: %v", err)
 	}
 	if written != 1 {
-		t.Fatalf("the row written by the transaction that spanned the retirement is not there. Its COMMIT "+
+		t.Fatalf("the row written by the transaction that spanned the retirement is not there. Its COMMIT " +
 			"returned no error, so this is the silent rollback: a write the application believes succeeded")
 	}
 
