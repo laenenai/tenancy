@@ -175,15 +175,48 @@ func (c Credential) MarshalJSON() ([]byte, error) { return json.Marshal(c.String
 // LogValue renders the credential as a slog group with the password and the
 // lease id redacted, so slog.Any("credential", c) is safe under every
 // handler.
+//
+// The two instants are strings rather than slog.Time values, which is a real
+// cost — a handler can no longer reformat them — paid for the reason
+// instantLayout gives: slog renders a time as extended-format RFC3339, which
+// is a row of standalone two-digit numbers, and one of them collides with the
+// length of the password this value holds.
 func (c Credential) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("username", c.Username),
 		slog.String("password", Redacted),
 		slog.String("lease_id", Redacted),
-		slog.Time("issued_at", c.IssuedAt),
-		slog.Time("expires_at", c.ExpiresAt),
+		slog.String("issued_at", renderInstant(c.IssuedAt)),
+		slog.String("expires_at", renderInstant(c.ExpiresAt)),
 	)
 }
+
+// instantLayout renders an instant as ISO 8601 *basic* format — no hyphens
+// and no colons — at the microsecond precision CanonicalTime truncates to.
+//
+// The separators are left out for a reason that took a CI failure to find,
+// and it generalises past this type. tenancytest's
+// NoSecretLeaksInAnyRendering treats the material's length in decimal as a
+// leak, which is right: knowing a password is 20 characters rather than 64
+// removes most of a search space. It matches that number only as a whole
+// token, bounded by non-alphanumeric characters — and an extended-format
+// timestamp is a row of two-digit numbers bounded by exactly that. So
+// "2026-10-23T15:20:08Z" contains a standalone "20", and a credential whose
+// password happened to be 20 characters long — which is what OpenBao issues
+// by default — failed the subtest at 15:20 and passed at 15:21.
+//
+// The subtest already drops slog's own timestamp for this reason; what it
+// did not anticipate is a *value* that carries instants of its own. Basic
+// format makes each one a single alphanumeric run, so no substring of it is
+// a standalone token and no password length can collide with it. The
+// information is identical and no less diagnosable.
+//
+// This is not specific to credentials, and it is worth knowing elsewhere:
+// any type whose safe rendering prints a small integer — a port, a
+// capacity, a version — can collide with the length of a secret it holds.
+// Pool.String prints WorkerCapacity, which is the same hazard with a
+// smaller surface.
+const instantLayout = "20060102T150405.000000Z"
 
 // renderInstant formats an instant for the renderings above, naming the zero
 // time as "never" rather than printing Go's zero date — a pool that is never
@@ -193,7 +226,7 @@ func renderInstant(t time.Time) string {
 	if t.IsZero() {
 		return "never"
 	}
-	return t.UTC().Format(time.RFC3339Nano)
+	return t.UTC().Format(instantLayout)
 }
 
 // StaticDSNCredentials is the default Credentials implementation: every pool

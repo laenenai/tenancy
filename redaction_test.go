@@ -17,6 +17,7 @@ package tenancy_test
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -173,14 +174,6 @@ const canaryIssuerMark = "CANARY-TOKEN-4b7e90ca"
 func TestNoTenancyTypeRendersAnIssuedCredential(t *testing.T) {
 	t.Parallel()
 
-	// The instants are fixed rather than taken from the clock, and that is
-	// not tidiness: NoSecretLeaksInAnyRendering treats the material's length
-	// in decimal as a leak, because knowing a password is 6 characters
-	// rather than 64 removes most of a search space — and a time of day is
-	// a run of two-digit numbers with non-alphanumeric separators, so a
-	// wall-clock timestamp in the value under test makes this subtest fail
-	// at 14:43 for a 43-byte secret and pass at 14:44. Pinning the instants
-	// is what makes the assertion about the value.
 	cred := tenancy.Credential{
 		Username:  "v-token-app-role-1792727407",
 		Password:  canaryPassword,
@@ -255,7 +248,10 @@ func TestIssuedCredentialRenderingStillSaysWhatItIs(t *testing.T) {
 	rendered := cred.String()
 	for _, want := range []string{
 		"tenancy.Credential", "v-token-app-role-1792727407",
-		"2026-10-23T12:00:00Z", "2026-10-23T13:00:00Z", domain.Redacted,
+		// ISO 8601 basic format, and the absence of the separators is
+		// load-bearing rather than a style choice: see
+		// TestCredentialRenderingCannotCollideWithAPasswordLength.
+		"20261023T120000.000000Z", "20261023T130000.000000Z", domain.Redacted,
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("Credential.String() = %q, want it to contain %q", rendered, want)
@@ -268,5 +264,48 @@ func TestIssuedCredentialRenderingStillSaysWhatItIs(t *testing.T) {
 	// read there.
 	if got := (tenancy.Credential{}).String(); !strings.Contains(got, "never") {
 		t.Errorf("the zero Credential renders as %q, want it to say its expiry is \"never\"", got)
+	}
+}
+
+// TestCredentialRenderingCannotCollideWithAPasswordLength is the regression
+// test for a CI failure that was a flaw in this type's rendering rather than
+// in the test that caught it.
+//
+// NoSecretLeaksInAnyRendering treats the material's length in decimal as a
+// leak, and rightly: knowing a password is 20 characters rather than 64
+// removes most of a search space. It matches that number as a whole token,
+// bounded by non-alphanumeric characters — and an extended-format timestamp
+// is a row of two-digit numbers bounded by exactly that. So a Credential
+// rendering its instants as "2026-10-23T15:20:08Z" contained a standalone
+// "20", and a credential whose issued password was 20 characters long —
+// OpenBao's default — failed the subtest at 15:20 and passed at 15:21.
+//
+// A pinned timestamp in the *test* does not fix that, it only makes it
+// deterministic: some other password length would then collide instead. So
+// the fix is in the type, and this is the assertion that pins it — the whole
+// rendering battery, against instants taken from the real clock, for every
+// password length a credential issuer plausibly produces.
+func TestCredentialRenderingCannotCollideWithAPasswordLength(t *testing.T) {
+	t.Parallel()
+
+	for n := 8; n <= 64; n++ {
+		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			t.Parallel()
+
+			// A password of exactly n characters — a repeated sentinel
+			// trimmed to length, so it is the length that varies and
+			// nothing else — and instants from the clock rather than
+			// pinned, because the collision this guards against was a
+			// function of the time of day.
+			password := strings.Repeat("Zq7", n)[:n]
+			issued := time.Now().UTC()
+			tenancytest.NoSecretLeaksInAnyRendering(t, tenancy.Credential{
+				Username:  "v-token-app-role-1792727407",
+				Password:  password,
+				LeaseID:   "database/creds/app/wBdUbo7iBqD0W6KmM8IuYrXh",
+				IssuedAt:  issued,
+				ExpiresAt: issued.Add(30 * time.Minute),
+			}, []byte(password))
+		})
 	}
 }
