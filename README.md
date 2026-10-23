@@ -6,8 +6,10 @@
 Who the tenants are, where their data lives, and a pgx connection already
 scoped to exactly one of them — failing closed if it is not.
 
-> **Status: design only.** This repository currently contains the charter and
-> the boundary. There is no implementation yet, and no release.
+> **Status: implemented, unreleased.** The registry, resolution, both
+> connection kinds and the conformance suite are here and green against a
+> real Postgres. No tag yet, and no consumer has swapped over: `cas` keeps
+> its own copy of the extracted code until the post-alpha swap.
 
 ## What it does
 
@@ -40,6 +42,65 @@ cross-tenant disclosure control are three chances to fail silently.
 
 Authorization rules, key material, migrations beyond its own registry tables,
 query building, or any consuming system's domain concepts.
+
+## Using it
+
+```go
+// Once, at startup, on the migration credential. The handle never escapes.
+if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{
+    DSN:     migrationDSN,
+    AppRole: "myapp",
+}); err != nil {
+    return err
+}
+
+// For the life of the process, on the runtime credential.
+ten, err := tenancy.Open(ctx, tenancy.Config{
+    RegistryDSN: runtimeDSN,
+    AppRole:     "myapp",
+    Cache:       tenancy.CacheOptions{TTL: time.Minute, NegativeTTL: 10 * time.Second},
+})
+if err != nil {
+    return err
+}
+defer ten.Close()
+
+// Control plane: the registry. No method here takes SQL.
+pool, err := ten.Control().CreatePool(ctx, tenancy.NewPool{
+    Name: "eu-main", Region: "eu-west-1", MetadataDSN: poolDSN,
+})
+
+// Data plane: one resolved tenant, with its session context already set.
+scoped, err := ten.Scope(ctx, tenantID)
+if err != nil {
+    return err // ErrNotAuthorizedOrNotFound, or ErrUnavailable if suspended
+}
+err = scoped.Tx(ctx, func(ctx context.Context, tx tenancy.TenantTx) error {
+    // tx satisfies sqlc's generated DBTX, so a consumer's own generated
+    // queries run tenant-scoped with no wrapper:
+    //     myqueries := gen.New(tx)
+    _, err := tx.Exec(ctx,
+        "INSERT INTO app.document (id, tenant_id, title) VALUES ($1, $2, $3)",
+        docID, tx.Tenant(), title)
+    return err
+})
+```
+
+A consumer's own tenant-scoped tables get the backstop by calling
+`tenancy.EnableRLS` from its own migration reconciler, and prove they have it
+by wiring `tenancy.AssertRLSCoverage` into a test. `Scoped.CheckEnforcement`
+reports whether Postgres will actually refuse a cross-tenant statement on
+this deployment's connection — call it at startup and refuse to serve if
+`FailClosed` is false, because a superuser connection makes every policy
+inert while looking entirely correct from Go.
+
+## The test harness
+
+`tenancy/testdb` is the shared container harness the other modules import
+(`CONVENTIONS.md` makes this module its home). `testdb.Start(t)` gives a test
+its own uniquely named, migrated database, skips under `-short`, and uses
+`TEST_DATABASE_URL` instead of a container when that is set. It is public
+surface and listed in `api.txt`.
 
 ## Documentation
 

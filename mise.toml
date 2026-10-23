@@ -29,7 +29,12 @@ run = "golangci-lint run"
 
 [tasks.test]
 description = "Inner loop: no containers, no databases. Skips at run time, never behind a build tag."
-run = "go test ./... -short"
+# -count=1 disables the test cache, deliberately. A cached PASS is how a
+# module-path rename once slipped through: the constants it moved were only
+# asserted by tests whose inputs the cache considered unchanged, so nothing
+# re-ran. The inner loop is fast enough that the cache buys nothing worth
+# that.
+run = "go test ./... -short -count=1"
 
 [tasks.build]
 description = "Proves the shipped binary is cgo-free: inherits CGO_ENABLED=0 from [env]."
@@ -42,7 +47,8 @@ description = "Full suite including container- and database-backed tests."
 # worth more in tests than cgo-freedom is; the cgo-free property is verified by
 # the `build` task, which `check` also depends on.
 env = { CGO_ENABLED = "1" }
-run = "go test ./... -race"
+# -count=1 for the same reason as the `test` task above.
+run = "go test ./... -race -count=1"
 
 [tasks.generate]
 description = "Regenerate sqlc query code from db/queries against db/migrations."

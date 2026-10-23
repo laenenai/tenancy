@@ -55,6 +55,18 @@ come with the code.
    industry standards, with CAS's migrator retired rather than extracted. This
    is the first visible drift between the three projects and it is cheaper to
    settle now than after acre's alpha.
+
+   **Reversed later the same day, 2026-10-23, by evidence rather than by
+   argument.** It *did* become a module: `pgmigrate`. Not in anticipation —
+   the `iam` and `audit` increments were built in parallel by agents that
+   could not see each other's work and produced the same machinery line for
+   line, including the same `1`/`300` poll constants, which is the
+   second-consumer rule satisfied by duplication that already happened. The
+   half of this decision that stands is the engine: it is goose everywhere,
+   and CAS's bespoke migrator is retired rather than extracted.
+
+   This module is `pgmigrate`'s first consumer, which is how that module
+   earns its confidence. See `internal/migrate`.
 2. **`config` and `obs` are deliberately NOT extracted yet.** CAS has ~1,400
    lines of each, and they are the classic contents of a catch-all shared
    module. The governing rule is that a module is created when a *second*
@@ -70,20 +82,38 @@ boundary rather than merely stating it:
 1. **`api.txt`** is the public API as a golden file, diffed in CI. Growing the
    public surface requires a reviewed diff, so a new responsibility cannot slip
    in quietly.
-2. **The conformance suite** (`suite.go`, following `cas/internal/blob/suite.go`)
-   is the contract. A consumer counts as *adopted* when this suite runs green
-   in that consumer's CI against its own wiring — not when someone says so.
+2. **The conformance suite** is the contract. A consumer counts as *adopted*
+   when this suite runs green in that consumer's CI against its own wiring —
+   not when someone says so.
+
+   Corrected 2026-10-23 during implementation: it is `tenancytest/suite.go`,
+   a sibling package, not a `suite.go` inside the production package
+   following `cas/internal/blob/suite.go`. `CONVENTIONS.md` had already
+   settled that and this file had not caught up. Both reasons are forced —
+   identifiers in `_test.go` files are not importable from another module,
+   and a non-`_test.go` file importing `testing` would put `testing` in every
+   consumer's production import graph.
 
 Its own test harness (`testdb`) lives here as a subpackage, not as a separate
-repo: it exists to test this module's contract.
+repo. Corrected 2026-10-23: it is not only "to test this module's contract" —
+`CONVENTIONS.md` makes this module the home of the **shared** container
+harness, which `cas` and `audit` have a copy of each and will import from here
+after the post-alpha swap. That makes it an exported package whose API is
+public surface in `api.txt`, not an `internal/` detail; a change to
+`testdb.Start`'s signature breaks other modules' test suites.
 
 ## Adoption
 
 | Consumer | State |
 |---|---|
-| cas | extraction pending — `internal/pool` (~1,691 lines), `internal/pg` (~1,026), `internal/domain/{tenant,pool}.go`, all built and tested |
+| cas | **extracted into this module 2026-10-23**; the swap in `cas` is pending. `internal/pool` (~1,691 lines) and `internal/pg` (~1,026) came across with their TOCTOU and partial-borrow regression tests; `cas` keeps its copy until the post-alpha swap, which is the agreed staged migration |
 | kgs | pending (phase 0 — required for the per-pool authorization projection, §6.2) |
 | acre | pending (no code yet; adopts from birth) |
+
+This module's own CI runs `tenancytest.RunTenancySuite` against
+`tenancy/testdb`, so "the suite is green" is true of the reference wiring. No
+consumer has run it against its own wiring yet, so by this file's own
+definition nothing is adopted.
 
 ## Provenance
 

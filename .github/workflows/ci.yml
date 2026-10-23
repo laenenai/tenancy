@@ -59,7 +59,11 @@ jobs:
 
       - name: test (inner loop — no containers, no databases)
         if: steps.pkgs.outputs.found == 'true'
-        run: go test ./... -short
+        # -count=1 disables the test cache, deliberately: a cached PASS is
+        # how a module-path rename once slipped through, because the
+        # constants it moved were only asserted by tests whose inputs the
+        # cache considered unchanged.
+        run: go test ./... -short -count=1
 
       - name: api.txt is current
         # The golden file is produced by the ROOT package's api_test.go, so the
@@ -92,4 +96,4 @@ jobs:
         if: steps.pkgs.outputs.found == 'true'
         env:
           CGO_ENABLED: "1"
-        run: go test ./... -race
+        run: go test ./... -race -count=1
