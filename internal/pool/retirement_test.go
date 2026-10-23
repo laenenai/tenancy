@@ -56,6 +56,14 @@ type fakeCredentials struct {
 	// Release was called. It must stay empty.
 	openAtRelease []string
 	issueErr      error
+
+	// releaseGate, when non-nil, blocks every Release until it is closed,
+	// and inFlight/maxInFlight record how many were blocked at once. It is
+	// how the shutdown test observes that releases overlap without having
+	// to wait out a timeout to prove it.
+	releaseGate chan struct{}
+	inFlight    int
+	maxInFlight int
 }
 
 func newFakeCredentials(ttl time.Duration, clock domain.Clock) *fakeCredentials {
@@ -107,10 +115,24 @@ func (f *fakeCredentials) Release(ctx context.Context, cred domain.Credential) e
 	}
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.released = append(f.released, cred)
 	if stillOpen {
 		f.openAtRelease = append(f.openAtRelease, cred.LeaseID)
+	}
+	gate := f.releaseGate
+	if gate != nil {
+		f.inFlight++
+		if f.inFlight > f.maxInFlight {
+			f.maxInFlight = f.inFlight
+		}
+	}
+	f.mu.Unlock()
+
+	if gate != nil {
+		<-gate
+		f.mu.Lock()
+		f.inFlight--
+		f.mu.Unlock()
 	}
 	return nil
 }
@@ -372,5 +394,73 @@ func TestResolve_StaticCredentialsNeverRetireAPool(t *testing.T) {
 	}
 	if issued, released := creds.counts(); issued != 0 || released != 0 {
 		t.Errorf("issued=%d released=%d for a static source, want 0 and 0", issued, released)
+	}
+}
+
+// TestClose_HandsBackEveryCredentialConcurrently covers the shutdown path.
+//
+// Two things are asserted and the second is the one that needed the code to
+// change. Every credential is handed back, because a process going away
+// should not leave live logins behind for their leases to time out. And the
+// releases overlap, because serially — with one timeout each — an
+// unreachable issuer would make shutdown take that timeout times the number
+// of pools ever opened, which is unbounded by default. That turns a
+// best-effort cleanup into minutes of hang in exactly the situation nobody
+// is watching.
+//
+// The overlap is observed by blocking every Release and waiting for two to
+// be in flight at once, rather than by timing a shutdown against an
+// unreachable issuer — which would mean waiting out a real timeout to prove
+// a point about waiting out real timeouts.
+func TestClose_HandsBackEveryCredentialConcurrently(t *testing.T) {
+	clock := domain.NewFixedClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
+	creds := newFakeCredentials(time.Hour, clock)
+	creds.releaseGate = make(chan struct{})
+
+	reg := newFakeRegistry()
+	var tenantIDs [2]domain.TenantID
+	for i := range tenantIDs {
+		poolID := domain.NewPoolID(clock)
+		tenantIDs[i] = domain.NewTenantID(clock)
+		reg.setPool(testPool(poolID, fakeDSN("close-release")))
+		reg.setTenant(activeTenant(tenantIDs[i], poolID))
+	}
+
+	r := pool.NewResolver(reg, retirementOpener(creds), pool.Options{
+		TTL: time.Hour, NegativeTTL: time.Hour,
+		Clock: clock, Credentials: creds, LongestTransaction: time.Minute,
+	})
+
+	ctx := context.Background()
+	for _, id := range tenantIDs {
+		mustResolve(ctx, t, r, id)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- r.Close() }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		creds.mu.Lock()
+		peak := creds.maxInFlight
+		creds.mu.Unlock()
+		if peak >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("at most %d credential release was in flight at a time while closing two pools. "+
+				"Serially, with one timeout each, an unreachable issuer makes shutdown take that timeout "+
+				"times the number of pools", peak)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	close(creds.releaseGate)
+	if err := <-closed; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, released := creds.counts(); released != 2 {
+		t.Errorf("%d credentials were handed back on shutdown, want 2", released)
 	}
 }

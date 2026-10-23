@@ -834,6 +834,16 @@ const credentialReleaseTimeout = 10 * time.Second
 // behaviour for a shutdown path, not the cross-tenant latency problem
 // backgrounding exists to avoid.
 //
+// The credentials those pools were connected on are handed back too, and
+// that part is bounded as a whole rather than per pool. Serially, with one
+// timeout each, an unreachable issuer would make shutdown take that timeout
+// times the number of pools ever opened — which is unbounded by default
+// (Options.MaxPools) and would turn a best-effort cleanup into minutes of
+// hang in exactly the situation where nobody is watching. So the releases
+// run concurrently under one shared deadline: a reachable issuer finishes
+// them in a round trip, and an unreachable one costs
+// credentialReleaseTimeout once.
+//
 // Close is idempotent: calling it more than once, including concurrently
 // with Resolve, is safe and the second call is a no-op.
 func (r *CachingResolver) Close() error {
@@ -854,19 +864,33 @@ func (r *CachingResolver) Close() error {
 	r.negativeTenants.clear()
 	r.mu.Unlock()
 
+	// Shutdown has no caller context to detach from: whoever owns this
+	// resolver's lifetime is the caller, and it is already blocked here on
+	// purpose (see this method's doc comment). One deadline covers every
+	// release.
+	releaseCtx, cancelReleases := context.WithTimeout(context.Background(), credentialReleaseTimeout)
+	defer cancelReleases()
+
+	var releases sync.WaitGroup
 	for _, entry := range entries {
 		r.mu.Lock()
 		alreadyClosed := entry.closed
 		entry.closed = true
 		r.mu.Unlock()
 
-		if !alreadyClosed {
-			entry.db.Close()
-			// Shutdown has no caller context to detach from: whoever owns
-			// this resolver's lifetime is the caller, and it is already
-			// blocked here on purpose (see this method's doc comment).
-			r.releaseCredential(context.Background(), entry.cred)
+		if alreadyClosed {
+			continue
 		}
+		entry.db.Close()
+		if entry.cred.IsZero() {
+			continue
+		}
+		releases.Add(1)
+		go func(cred domain.Credential) {
+			defer releases.Done()
+			_ = r.creds.Release(releaseCtx, cred)
+		}(entry.cred)
 	}
+	releases.Wait()
 	return nil
 }
