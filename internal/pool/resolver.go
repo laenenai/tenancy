@@ -460,7 +460,11 @@ func (r *CachingResolver) resolveHandle(ctx context.Context, tenant domain.Tenan
 // in the same critical section that can eventually mark it closed, so
 // pools.get should never find a closed entry still sitting in the cache.
 // It costs nothing to check anyway, and documents the invariant.
-func (r *CachingResolver) getAndBorrow(poolID domain.PoolID) (*poolEntry, bool) {
+//
+// ctx is not consulted here and is only carried through: a lookup that
+// retires an entry may be the one that closes it, and closing hands the
+// credential back (see closeInBackground).
+func (r *CachingResolver) getAndBorrow(ctx context.Context, poolID domain.PoolID) (*poolEntry, bool) {
 	now := r.clock.Now()
 
 	r.mu.Lock()
@@ -477,7 +481,7 @@ func (r *CachingResolver) getAndBorrow(poolID domain.PoolID) (*poolEntry, bool) 
 	if retired, closeNow := r.retireIfDueLocked(poolID, entry, now); retired {
 		r.mu.Unlock()
 		if closeNow {
-			r.closeInBackground(entry)
+			r.closeInBackground(ctx, entry)
 		}
 		return nil, false
 	}
@@ -548,7 +552,7 @@ var testHookDuringGetAndBorrow func()
 // resolves/opens again, rather than ever handing out a stale reference.
 func (r *CachingResolver) ensurePool(ctx context.Context, poolID domain.PoolID) (*poolEntry, error) {
 	for {
-		if entry, ok := r.getAndBorrow(poolID); ok {
+		if entry, ok := r.getAndBorrow(ctx, poolID); ok {
 			return entry, nil
 		}
 		if err := r.openNewPool(ctx, poolID); err != nil {
@@ -626,7 +630,7 @@ func (r *CachingResolver) openNewPool(ctx context.Context, poolID domain.PoolID)
 		r.mu.Unlock()
 
 		if wasEvicted && shouldCloseEvicted {
-			r.closeInBackground(evicted)
+			r.closeInBackground(ctx, evicted)
 		}
 		return nil, nil
 	})
@@ -690,7 +694,7 @@ func (r *CachingResolver) retirementInstant(cred domain.Credential) (time.Time, 
 // does; see poolEntry's doc comment for why that is the conservative,
 // correct default — and returns the Handle for it.
 func (r *CachingResolver) borrow(ctx context.Context, entry *poolEntry, tenant domain.Tenant) Handle {
-	context.AfterFunc(ctx, func() { r.release(entry) })
+	context.AfterFunc(ctx, func() { r.release(ctx, entry) })
 	return Handle{Pool: entry.pool, Tenant: tenant, DB: entry.db}
 }
 
@@ -698,8 +702,10 @@ func (r *CachingResolver) borrow(ctx context.Context, entry *poolEntry, tenant d
 // that was the last one and entry has already been retired.
 //
 // The actual Close call is backgrounded (closeInBackground), not run on
-// this goroutine: see retireLocked's doc comment for why.
-func (r *CachingResolver) release(entry *poolEntry) {
+// this goroutine: see retireLocked's doc comment for why. ctx is the
+// borrower's, already finished by the time this runs — releaseCredential is
+// where that is dealt with.
+func (r *CachingResolver) release(ctx context.Context, entry *poolEntry) {
 	r.mu.Lock()
 	entry.refs--
 	shouldClose := entry.refs == 0 && entry.retired && !entry.closed
@@ -716,7 +722,7 @@ func (r *CachingResolver) release(entry *poolEntry) {
 	r.mu.Unlock()
 
 	if shouldClose {
-		r.closeInBackground(entry)
+		r.closeInBackground(ctx, entry)
 	}
 }
 
@@ -767,10 +773,10 @@ func (r *CachingResolver) retireLocked(entry *poolEntry) (shouldCloseNow bool) {
 // actually closed, because releasing it first would revoke the login under
 // connections still finishing their work — which is precisely the
 // mid-transaction 42501 this whole arrangement exists to avoid.
-func (r *CachingResolver) closeInBackground(entry *poolEntry) {
+func (r *CachingResolver) closeInBackground(ctx context.Context, entry *poolEntry) {
 	go func() {
 		entry.db.Close()
-		r.releaseCredential(entry.cred)
+		r.releaseCredential(ctx, entry.cred)
 	}()
 }
 
@@ -792,13 +798,18 @@ func (r *CachingResolver) closeInBackground(entry *poolEntry) {
 // an optimization that returns the credential early and keeps the number of
 // live logins bounded by what is in use rather than by what has ever been
 // issued.
-func (r *CachingResolver) releaseCredential(cred domain.Credential) {
+//
+// ctx is detached rather than inherited, with context.WithoutCancel: the
+// trigger for this call is that the last borrower's context has *finished*,
+// so a release that inherited its cancellation would never be attempted at
+// all — while anything else ctx carries, a trace span in particular, is
+// exactly what makes the release attributable to the resolution that caused
+// it.
+func (r *CachingResolver) releaseCredential(ctx context.Context, cred domain.Credential) {
 	if cred.IsZero() {
 		return
 	}
-	// A context of its own: the caller's is long gone by now, and a
-	// release that inherited a cancelled context would never be attempted.
-	ctx, cancel := context.WithTimeout(context.Background(), credentialReleaseTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialReleaseTimeout)
 	defer cancel()
 	_ = r.creds.Release(ctx, cred)
 }
@@ -851,7 +862,10 @@ func (r *CachingResolver) Close() error {
 
 		if !alreadyClosed {
 			entry.db.Close()
-			r.releaseCredential(entry.cred)
+			// Shutdown has no caller context to detach from: whoever owns
+			// this resolver's lifetime is the caller, and it is already
+			// blocked here on purpose (see this method's doc comment).
+			r.releaseCredential(context.Background(), entry.cred)
 		}
 	}
 	return nil

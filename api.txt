@@ -26,6 +26,10 @@ type Config = scope.Config
 
 type Control = registry.Control
 
+type Credential = domain.Credential
+
+type Credentials = domain.Credentials
+
 type DDL = pg.DDL
 
 type DSN = domain.DSN
@@ -112,6 +116,8 @@ const SecurityModeTenantKey = domain.SecurityModeTenantKey
 
 const SecurityModeVault = domain.SecurityModeVault
 
+type StaticDSNCredentials = domain.StaticDSNCredentials
+
 type SystemClock = domain.SystemClock
 
 type TableEnforcement = pg.TableEnforcement
@@ -137,6 +143,68 @@ const TenantStatusDeleting = domain.TenantStatusDeleting
 const TenantStatusSuspended = domain.TenantStatusSuspended
 
 type TenantTx = pg.TenantTx
+
+package openbao // credentials/openbao
+
+type Config struct {
+	Address string
+	Token string
+	MountPath string
+	Role string
+	RoleFor func(p domain.Pool) (string, error)
+	HTTPClient *http.Client
+	Clock domain.Clock
+}
+
+func (Config) Format(s fmt.State, _ rune)
+
+func (Config) LogValue() slog.Value
+
+func (Config) MarshalJSON() ([]byte, error)
+
+func (Config) String() string
+
+func CreationStatements(appRole string) ([]string, error)
+
+type Credentials struct {
+	// has unexported fields
+}
+
+func (*Credentials) CheckRole(ctx context.Context, role string) (RoleCheck, error)
+
+func (*Credentials) Format(s fmt.State, _ rune)
+
+func (*Credentials) Issue(ctx context.Context, p domain.Pool) (domain.Credential, error)
+
+func (*Credentials) LogValue() slog.Value
+
+func (*Credentials) MarshalJSON() ([]byte, error)
+
+func (*Credentials) Release(ctx context.Context, cred domain.Credential) error
+
+func (*Credentials) String() string
+
+const DefaultMountPath = "database"
+
+const DefaultTimeout = 30 * time.Second
+
+func Open(ctx context.Context, cfg Config) (*Credentials, error)
+
+type RoleCheck struct {
+	Role string
+	Exists bool
+	DefaultTTL time.Duration
+	MaxTTL time.Duration
+	HasValidUntil bool
+	GrantsInheritance bool
+	DeclaresNoInherit bool
+	GrantsRLSBypass bool
+	GrantsObjectCreation bool
+}
+
+func (RoleCheck) Findings() []string
+
+func (RoleCheck) Usable() bool
 
 package tenancytest // tenancytest
 
