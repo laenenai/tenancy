@@ -12,6 +12,7 @@
 [tools]
 go            = "1.25.6"
 golangci-lint = "2.11.4"
+sqlc          = "1.30.0"
 gofumpt       = "0.9.2"
 
 [env]
@@ -44,8 +45,18 @@ env = { CGO_ENABLED = "1" }
 run = "go test ./... -race"
 
 [tasks.generate]
-description = "Regenerate sqlc query code. No-op until the module has a sqlc.yaml."
-run = "test -f sqlc.yaml && sqlc generate || echo 'no sqlc.yaml — nothing to generate'"
+description = "Regenerate sqlc query code from db/queries against db/migrations."
+# Deliberately NOT guarded as `test -f sqlc.yaml && sqlc generate || echo ...`.
+# An earlier version was, and it was a hole in the gate: once a module has a
+# sqlc.yaml, the trailing `||` turns a *generation failure* into a task that
+# exits 0 while printing a reassuring message. A module with no queries yet has
+# no sqlc.yaml, and `sqlc generate` says so and fails — which is the correct
+# answer to "generate the thing that does not exist".
+#
+# sqlc is pinned in [tools] because generated code is committed and its header
+# records the version that produced it: an unpinned generator makes every
+# developer's `generate` a diff.
+run = "sqlc generate"
 
 [tasks.api]
 description = "Regenerate api.txt, the public-surface golden file the charter requires."

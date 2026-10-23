@@ -238,6 +238,37 @@ Anything else hand-written is a departure that needs a reason in the package
 doc — and "the SQL matters here" is not one, because that is the case sqlc
 serves best.
 
+**Two limits of sqlc found in practice, recorded so they are not rediscovered:**
+
+- **It cannot generate catalog queries.** sqlc resolves every relation against
+  the `schema:` directory, which contains migrations and no `pg_catalog`, so a
+  query reading `pg_roles`, `pg_class` or `pg_trigger` fails generation with
+  `relation "pg_roles" does not exist`. There is a workaround — adding a fake
+  `pg_catalog` schema file — and it should be **declined**: generated code
+  would then agree with a fiction that drifts from the real catalog. Privilege
+  and enforcement probes stay hand-written for this reason, which is a limit of
+  the tool rather than a judgement about the SQL.
+- **A fixed-size array cannot be overridden onto a `bytea` column.** pgx has no
+  scan plan from `bytea` into `[32]byte`, so an override compiles and then fails
+  at run time, and the only way to give pgx a plan is `sql.Scanner` /
+  `driver.Valuer` on the type — which, for a digest or any other
+  security-relevant value, is the thing the rule above forbids. Map the column
+  to `[]byte` and convert through the type's validating constructor, which
+  rejects a wrong length instead of truncating.
+
+**And one generator quirk**: sqlc v1.30.0 collapses repeated `sqlc.arg()`
+references to a single parameter but does **not** collapse repeated `@name`
+ones — `@sequence` used twice generates a params struct with two fields called
+`Sequence`, which is not valid Go. Use `sqlc.arg()` where a parameter appears
+more than once, so arithmetic like `sequence = arg - 1` can stay in the SQL
+rather than moving into Go.
+
+**Pin the generator.** Generated code is committed and its header records the
+version that wrote it, so an unpinned `sqlc` makes every developer's
+`generate` a diff. The modules pin **1.30.0**, which produced the committed
+code; `cas` pins 1.31.1. Converging is a deliberate one-commit bump across
+`cas`, `audit` and `iam` together, not a drift to be fixed per repo.
+
 ## Errors
 
 - **Sentinel errors declared once**, re-exported from the facade, documented
