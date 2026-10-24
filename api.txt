@@ -232,6 +232,8 @@ func (Deployment) String() string
 
 func NoSecretLeaksInAnyRendering(t *testing.T, v any, material []byte)
 
+func RendersOnlyARedactionMarker(t *testing.T, v any)
+
 func RunCredentialsSuite(t *testing.T, newSource func(t *testing.T) CredentialSource)
 
 func RunTenancySuite(t *testing.T, newDeployment func(t *testing.T) Deployment)
