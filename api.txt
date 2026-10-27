@@ -558,9 +558,17 @@ type TenantTx struct {
 
 func (TenantTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 
+func (TenantTx) Format(st fmt.State, _ rune)
+
+func (TenantTx) LogValue() slog.Value
+
+func (TenantTx) MarshalJSON() ([]byte, error)
+
 func (TenantTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 
 func (TenantTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+
+func (TenantTx) String() string
 
 func (TenantTx) Tenant() domain.TenantID
 
