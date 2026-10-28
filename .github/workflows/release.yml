@@ -1,0 +1,60 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "testdb/v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+        with:
+          install: true
+          cache: true
+
+      # A tag is not a release until the same gate as main has passed on it.
+      - name: check
+        run: mise run check
+
+      # gorelease requires a clean tree and compares against the published
+      # latest version. It is deliberately not in the dirty-branch gate.
+      - name: gorelease
+        if: startsWith(github.ref_name, 'v')
+        run: |
+          go run golang.org/x/exp/cmd/gorelease@v0.0.0-20261014143641-f0251eb4aa3e \
+            -base=latest -version="${GITHUB_REF_NAME}"
+
+      # The nested harness has its own tag prefix. Its replace directive is a
+      # local-development aid; publish the root module first, then update and
+      # tag testdb. This step validates the module layout without pretending a
+      # replace is a release.
+      - name: gorelease testdb
+        if: startsWith(github.ref_name, 'testdb/')
+        working-directory: testdb
+        run: |
+          version="${GITHUB_REF_NAME#testdb/}"
+          # A published module must not carry the local-development replace.
+          # Release the root module first so the v0.4.0 requirement resolves.
+          cp go.mod go.mod.release
+          trap 'mv go.mod.release go.mod' EXIT
+          sed -i '/^replace github.com\/laenenai\/tenancy => ..\/$/d' go.mod
+          go run golang.org/x/exp/cmd/gorelease@v0.0.0-20261014143641-f0251eb4aa3e \
+            -base=none -version="${version}"
+
+      - name: create GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          body_path: CHANGELOG.md
+          generate_release_notes: false
+          draft: false
+          prerelease: false

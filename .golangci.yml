@@ -25,23 +25,19 @@ linters:
           msg: "panic is forbidden outside main; return a typed error instead"
     depguard:
       rules:
-        # internal/obs is the only package that creates OTel metric
-        # instruments or wires the metric SDK. Its own NewCounter /
-        # NewUpDownCounter / NewHistogram enforce the cardinality
-        # discipline (no tenant/document/blob/principal/job id as a
-        # metric attribute) at both instrument-creation and measurement
-        # time; calling go.opentelemetry.io/otel/metric directly from
-        # anywhere else bypasses that enforcement entirely, so it is
-        # denied at the import level rather than relying on convention.
-        otel-metric-boundary:
+        # The previous obs/otel rule was stale: this module has no internal/obs
+        # and no OTel metric dependency. Keep depguard enabled for the next
+        # real boundary rather than documenting a package that does not exist.
+        module-boundaries:
           list-mode: lax
           files:
-            - "!**/internal/obs/**"
+            - "**/internal/domain/**"
+            - "**/internal/pg/**"
+            - "**/internal/pool/**"
+            - "**/internal/registry/**"
           deny:
-            - pkg: go.opentelemetry.io/otel/metric
-              desc: "create instruments via internal/obs.NewCounter/NewUpDownCounter/NewHistogram instead of the OTel metric API directly"
-            - pkg: go.opentelemetry.io/otel/sdk/metric
-              desc: "only internal/obs wires the metric SDK (see obs.Setup)"
+            - pkg: github.com/laenenai/tenancy/internal/scope
+              desc: "internal/scope is the composition layer; these packages must not import it"
   exclusions:
     rules:
       # panic is allowed only in the main package itself: files directly

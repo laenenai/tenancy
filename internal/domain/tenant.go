@@ -76,6 +76,22 @@ func (s TenantStatus) Valid() bool {
 	}
 }
 
+// CanTransitionTo reports whether s may move to next. Suspension is
+// reversible; deletion is terminal, because moving a deleting tenant back to
+// active could resurrect a tenant whose data is already being erased. The
+// schema enforces the same rule with a trigger, so a hand-run UPDATE cannot
+// bypass it.
+func (s TenantStatus) CanTransitionTo(next TenantStatus) bool {
+	switch s {
+	case TenantStatusActive, TenantStatusSuspended:
+		return next == TenantStatusActive || next == TenantStatusSuspended || next == TenantStatusDeleting
+	case TenantStatusDeleting:
+		return next == TenantStatusDeleting
+	default:
+		return false
+	}
+}
+
 // Tenant is the top-level unit of isolation: every tenant-scoped row in
 // every pool is reachable only through the tenant id this record names,
 // and every row-level-security policy keys off it.

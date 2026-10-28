@@ -45,7 +45,7 @@ type poolEntry struct {
 	// or by Close, which is every entry whose credential does not expire.
 	//
 	// It is deliberately earlier than cred.ExpiresAt, by the lead time
-	// Options.LongestTransaction names, because a credential's expiry is
+	// LifecycleOptions.LongestTransaction names, because a credential's expiry is
 	// neither a disconnect nor a clean cut-off. Measured (see
 	// docs/superpowers/spikes/2026-10-23-openbao-db-credentials.md): no
 	// connection closes and conn.IsClosed stays false, a transaction that
@@ -159,6 +159,9 @@ func (c *lru[K, V]) remove(key K) bool {
 	delete(c.byKey, key)
 	return true
 }
+
+// len returns the number of entries currently cached.
+func (c *lru[K, V]) len() int { return c.order.Len() }
 
 // all returns every value currently cached, most-recently-used first.
 func (c *lru[K, V]) all() []V {

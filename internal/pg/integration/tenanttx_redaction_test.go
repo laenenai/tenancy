@@ -45,7 +45,7 @@ func TestTenantTxNeverRendersTheConnectionsPassword(t *testing.T) {
 	password := passwordFromDSN(t, string(db.DSN()))
 
 	tenant := domain.Tenant{ID: domain.NewTenantID(domain.SystemClock{})}
-	scoped := pg.NewScoped(tenant, domain.Pool{}, db.Pool(), "")
+	scoped := pg.NewScoped(tenant, domain.PoolRef{}, db.Pool(), "")
 
 	err := scoped.Tx(context.Background(), func(_ context.Context, tx pg.TenantTx) error {
 		renderings := map[string]string{"String()": tx.String()}

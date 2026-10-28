@@ -81,10 +81,11 @@ func TestNoTenancyTypeRendersADSN(t *testing.T) {
 		// startup is the normal thing to do, which is what makes these the
 		// leaks that would actually have happened.
 		{"Config", tenancy.Config{RegistryDSN: tenancy.DSN(canaryDSN), AppRole: "app"}},
+		{"ConfigWithCredentials", tenancy.Config{RegistryDSN: tenancy.DSN(canaryDSN), AppRole: "app", Credentials: leakyCredentials{Token: canaryDSN}}},
 		{"MigrateConfig", tenancy.MigrateConfig{DSN: tenancy.DSN(canaryDSN), AppRole: "app"}},
 
 		// NewPool is the value a consumer builds by hand.
-		{"NewPool", tenancy.NewPool{
+		{"NewPool", tenancy.PoolSpec{
 			Name:           "pool-b",
 			Region:         "eu-west-1",
 			MetadataDSN:    tenancy.DSN(canaryDSN),
@@ -97,7 +98,7 @@ func TestNoTenancyTypeRendersADSN(t *testing.T) {
 		// call a method and reflects the whole subtree instead. Before
 		// Scoped had its own four methods, %+v on one printed the password
 		// even though domain.DSN redacts perfectly on its own.
-		{"Scoped", pg.NewScoped(tenant, pool, nil, "app")},
+		{"Scoped", pg.NewScoped(tenant, pool.Ref(), nil, "app")},
 
 		// The zero Scoped denies rather than panicking, and it must render
 		// safely too — a handle that denied is a handle something is about
@@ -110,6 +111,7 @@ func TestNoTenancyTypeRendersADSN(t *testing.T) {
 			MigrationDSN: tenancy.DSN(canaryDSN),
 			RuntimeDSN:   tenancy.DSN(canaryDSN),
 			AppRole:      "app",
+			ControlRole:  "control",
 		}},
 	}
 
@@ -309,3 +311,11 @@ func TestCredentialRenderingCannotCollideWithAPasswordLength(t *testing.T) {
 		})
 	}
 }
+
+type leakyCredentials struct{ Token string }
+
+func (l leakyCredentials) Issue(context.Context, tenancy.PoolRef) (tenancy.Credential, error) {
+	return tenancy.Credential{}, nil
+}
+
+func (l leakyCredentials) Release(context.Context, tenancy.Credential) error { return nil }

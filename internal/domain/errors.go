@@ -52,6 +52,12 @@ var ErrNotAuthorizedOrNotFound = errors.New("tenancy: not authorized or not foun
 // which is a definitive answer about existence.
 var ErrUnavailable = errors.New("tenancy: unavailable")
 
+// ErrPermission indicates the deployment's role lacks a privilege the
+// operation requires: a registry grant, a SET ROLE target, or DDL. It is a
+// permanent configuration error, not a transient outage; retrying will not
+// help. It is deliberately distinct from ErrUnavailable, which is retryable.
+var ErrPermission = errors.New("tenancy: permission denied")
+
 // ErrConflict indicates a registry write could not complete because it
 // conflicts with existing state: a duplicate tenant or pool name, a
 // tenant naming a pool that does not exist, or an attempt to change a

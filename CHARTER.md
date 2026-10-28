@@ -34,6 +34,22 @@ explicitly, because getting it wrong is a cross-tenant leak:
 Two connection kinds, one module, and the type system should make it impossible
 to run a data-plane query on a control-plane handle.
 
+**Roles (decided 2026-10-28).** The control plane and the data plane use
+different Postgres roles. `Migrate` creates two `NOLOGIN` grantees: `AppRole`
+(data) and `ControlRole` (registry `SELECT/INSERT/UPDATE`). The deployment
+creates the `LOGIN` identities and grants each grantee to its login. The data
+role deliberately has no registry privileges. A `Scoped.Pool()` returns a
+`PoolRef` with no `MetadataDSN`, and credential sources receive only a
+`PoolRef`, so a data-plane handler cannot open an unscoped connection.
+
+**RLS threat model (decided 2026-10-28).** Application-level scoping is
+primary; RLS is a backstop against a forgotten predicate or an application bug.
+It does not contain SQL injection or a DDL-capable/owning role. The deployment
+must give the data role no DDL or ownership rights and use parameterized SQL.
+`CheckEnforcement` and `AssertRLSCoverage` inspect the policy predicate,
+`WITH CHECK`, the permissive companion, and ownership, but they are diagnostics,
+not a proof against arbitrary SQL. See `THREAT_MODEL.md`.
+
 ## Why this is shared at all
 
 Not duplication — blast radius. Both the CAS and kgs designs specify Postgres
@@ -128,9 +144,11 @@ A shared module with no stated boundary accretes until it is the dependency
 every project has and nobody can reason about. Two mechanisms enforce the
 boundary rather than merely stating it:
 
-1. **`api.txt`** is the public API as a golden file, diffed in CI. Growing the
-   public surface requires a reviewed diff, so a new responsibility cannot slip
-   in quietly.
+1. **`apidiff`/`gorelease`** is the public-API compatibility gate. `apidiff`
+   compares the importable API with the previous tag on every change; `gorelease`
+   validates a clean release tree. Internal packages are outside the contract,
+   so private implementation changes do not create review noise, and a new
+   public responsibility cannot slip in without appearing in the diff.
 2. **The conformance suite** is the contract. A consumer counts as *adopted*
    when this suite runs green in that consumer's CI against its own wiring —
    not when someone says so.
@@ -143,13 +161,16 @@ boundary rather than merely stating it:
    and a non-`_test.go` file importing `testing` would put `testing` in every
    consumer's production import graph.
 
-Its own test harness (`testdb`) lives here as a subpackage, not as a separate
-repo. Corrected 2026-10-23: it is not only "to test this module's contract" —
-`CONVENTIONS.md` makes this module the home of the **shared** container
-harness, which `cas` and `audit` have a copy of each and will import from here
-after the post-alpha swap. That makes it an exported package whose API is
-public surface in `api.txt`, not an `internal/` detail; a change to
-`testdb.Start`'s signature breaks other modules' test suites.
+Its own test harness (`testdb`) lives here as a nested module, not as a
+separate repo. Corrected 2026-10-23: it is not only "to test this module's
+contract" — `CONVENTIONS.md` makes this module the home of the **shared**
+container harness, which `cas` and `audit` have a copy of each and will import
+from here after the post-alpha swap. The nested module keeps testcontainers out
+of the production dependency graph while preserving the import path. That makes
+it an exported package whose API is public surface in the `testdb` module, not
+an `internal/` detail; a change to `testdb.Start`'s signature breaks other
+modules' test suites and is reported by `apidiff`/`gorelease` when the module is
+released.
 
 ## Adoption
 
@@ -163,6 +184,17 @@ This module's own CI runs `tenancytest.RunTenancySuite` against
 `tenancy/testdb`, so "the suite is green" is true of the reference wiring. No
 consumer has run it against its own wiring yet, so by this file's own
 definition nothing is adopted.
+
+## Release policy
+
+Decided 2026-10-28:
+
+- 0.x minor releases may break the API; patch releases are fixes.
+- Every breaking change has a `CHANGELOG.md` entry and an `UPGRADING.md`
+  section.
+- `main` is tagged only after `mise run check` (fmt, lint, build, race/container
+  tests, sqlc diff, govulncheck).
+- 1.0 is cut after the P0/P1 items in the 2026-10-28 review are closed.
 
 ## Provenance
 

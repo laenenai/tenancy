@@ -65,10 +65,12 @@ func (v lengthDisclosingValue) placeholder() string {
 	return "selftest(redacted, " + strconv.Itoa(len(v.b)) + " bytes)"
 }
 
-func (v lengthDisclosingValue) String() string               { return v.placeholder() }
-func (v lengthDisclosingValue) Format(s fmt.State, _ rune)   { _, _ = io.WriteString(s, v.placeholder()) }
+func (v lengthDisclosingValue) String() string             { return v.placeholder() }
+func (v lengthDisclosingValue) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, v.placeholder()) }
+
 func (v lengthDisclosingValue) MarshalJSON() ([]byte, error) { return json.Marshal(v.placeholder()) }
-func (v lengthDisclosingValue) LogValue() slog.Value         { return slog.StringValue(v.placeholder()) }
+
+func (v lengthDisclosingValue) LogValue() slog.Value { return slog.StringValue(v.placeholder()) }
 
 func TestSafeValueHasNoMissingInterfacesAndNoLeaks(t *testing.T) {
 	t.Parallel()

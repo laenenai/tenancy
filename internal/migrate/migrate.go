@@ -52,6 +52,8 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/laenenai/pgmigrate"
 
 	"github.com/laenenai/tenancy/db/migrations"
@@ -101,16 +103,19 @@ type Config struct {
 	// Required.
 	DSN domain.DSN
 
-	// AppRole is the Postgres role the control plane and every resolved
-	// pool connect as at run time. Up ensures it exists as a NOLOGIN role
-	// and asserts exactly the registry privileges it must hold, on every
-	// run.
+	// AppRole is the data-plane application role every resolved pool
+	// narrows itself into with SET LOCAL ROLE. Up ensures it exists as a
+	// NOLOGIN role. It deliberately receives no registry privileges.
 	//
-	// Required: there is no sensible default, and defaulting it would mean
-	// granting the registry to a role nobody chose. A deployment that
-	// genuinely runs everything as the owner is a deployment with no
-	// privilege separation, and it should have to say so.
+	// Required for Up; not required for Status.
 	AppRole string
+
+	// ControlRole is the grantee that receives the registry's SELECT,
+	// INSERT and UPDATE privileges. The control plane's LOGIN role is a
+	// member of it; the data-plane AppRole is not.
+	//
+	// Required for Up; not required for Status.
+	ControlRole string
 
 	// Postgres tunes the short-lived migration pool. Its ApplicationName
 	// and ConnectTimeout are the fields worth setting; the connection
@@ -135,7 +140,7 @@ func LockKey() int64 { return pgmigrate.LockKey(Identity) }
 // on every path, including every error path. See the package doc comment
 // for why the handle does not escape.
 func Up(ctx context.Context, cfg Config) error {
-	resolved, err := cfg.resolve()
+	resolved, err := cfg.resolve(true)
 	if err != nil {
 		return err
 	}
@@ -159,7 +164,7 @@ func Up(ctx context.Context, cfg Config) error {
 // the version table requires the schema to exist, which pgmigrate creates,
 // so Status is a migration-credential operation and not a runtime one.
 func Status(ctx context.Context, cfg Config) ([]Applied, error) {
-	resolved, err := cfg.resolve()
+	resolved, err := cfg.resolve(false)
 	if err != nil {
 		return nil, err
 	}
@@ -186,15 +191,17 @@ func Status(ctx context.Context, cfg Config) ([]Applied, error) {
 // included. The four methods below are why it does not. See CONVENTIONS.md's
 // "Rendering a secret"; redactlint reports exactly this shape.
 type resolvedConfig struct {
-	dsn      domain.DSN
-	appRole  string
-	postgres pg.PoolConfig
+	dsn         domain.DSN
+	appRole     string
+	controlRole string
+	postgres    pg.PoolConfig
 }
 
 // String names the application role and redacts the migration credential.
 func (c resolvedConfig) String() string {
-	return fmt.Sprintf("migrate.resolvedConfig{dsn: %s, appRole: %q, postgres: %+v}",
-		c.dsn, c.appRole, c.postgres)
+	return fmt.Sprintf("migrate.resolvedConfig{dsn: %s, appRole: %q, controlRole: %q, postgres: {MaxConns: %d, MinConns: %d, ConnectTimeout: %s, ApplicationName: %q}}",
+		c.dsn, c.appRole, c.controlRole, c.postgres.MaxConns, c.postgres.MinConns,
+		c.postgres.ConnectTimeout, c.postgres.ApplicationName)
 }
 
 // Format implements fmt.Formatter, the only interface fmt consults for every
@@ -209,18 +216,27 @@ func (c resolvedConfig) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("dsn", domain.Redacted),
 		slog.String("app_role", c.appRole),
+		slog.String("control_role", c.controlRole),
 	)
 }
 
-func (c Config) resolve() (resolvedConfig, error) {
+func (c Config) resolve(requireRoles bool) (resolvedConfig, error) {
 	if c.DSN.IsZero() {
 		return resolvedConfig{}, fmt.Errorf(
 			"%w: migrate: DSN is required: it is the migration credential, which is deliberately not the runtime one",
 			domain.ErrInvalidConfig)
 	}
+	if !requireRoles {
+		return resolvedConfig{dsn: c.DSN, postgres: c.Postgres}, nil
+	}
 	if c.AppRole == "" {
 		return resolvedConfig{}, fmt.Errorf(
-			"%w: migrate: AppRole is required: the registry grants are asserted against it on every run, and a deployment with no privilege separation should have to say so",
+			"%w: migrate: AppRole is required: it names the data-plane role the schema's grants must not reach",
+			domain.ErrInvalidConfig)
+	}
+	if c.ControlRole == "" {
+		return resolvedConfig{}, fmt.Errorf(
+			"%w: migrate: ControlRole is required: the registry grants are asserted against it on every run",
 			domain.ErrInvalidConfig)
 	}
 	if !pgmigrate.IsPlainIdentifier(c.AppRole) {
@@ -228,7 +244,12 @@ func (c Config) resolve() (resolvedConfig, error) {
 			"%w: migrate: AppRole %q is not a plain identifier: letters, digits and underscore, not starting with a digit",
 			domain.ErrInvalidConfig, c.AppRole)
 	}
-	return resolvedConfig{dsn: c.DSN, appRole: c.AppRole, postgres: c.Postgres}, nil
+	if !pgmigrate.IsPlainIdentifier(c.ControlRole) {
+		return resolvedConfig{}, fmt.Errorf(
+			"%w: migrate: ControlRole %q is not a plain identifier: letters, digits and underscore, not starting with a digit",
+			domain.ErrInvalidConfig, c.ControlRole)
+	}
+	return resolvedConfig{dsn: c.DSN, appRole: c.AppRole, controlRole: c.ControlRole, postgres: c.Postgres}, nil
 }
 
 // pgmigrateConfig is the whole of what this module tells pgmigrate.
@@ -241,12 +262,13 @@ func (c resolvedConfig) pgmigrateConfig() pgmigrate.Config {
 		Schema:      Schema,
 		Identity:    Identity,
 		Migrations:  migrations.FS,
-		Reconcilers: []pgmigrate.Reconciler{registryPrivileges(c.appRole)},
+		Reconcilers: []pgmigrate.Reconciler{registryPrivileges(c.controlRole, c.appRole)},
 	}
 }
 
-// registryPrivileges is this module's one reconciler: the application role
-// exists, and holds exactly the registry privileges it needs and no more.
+// registryPrivileges is this module's one reconciler: both grantees exist, and
+// the control role holds exactly the registry privileges it needs and no more.
+// The data-plane AppRole is created but receives no registry grant.
 //
 // The grant set is small and each line is a decision:
 //
@@ -260,17 +282,31 @@ func (c resolvedConfig) pgmigrateConfig() pgmigrate.Config {
 //     indistinguishably from unknown. A registry row that could be removed
 //     would make a tenant's pool assignment — and therefore the location
 //     of its data — forgettable.
-//   - REFERENCES and TRIGGER revoked. Either would let the application
-//     role attach something of its own to the registry: a foreign key that
+//   - REFERENCES and TRIGGER revoked. Either would let the control role
+//     attach something of its own to the registry: a foreign key that
 //     constrains what an operator may change, or a trigger that runs on
-//     every registry write. Neither is the application role's business.
+//     every registry write. Neither is the control role's business.
 //   - PUBLIC revoked from the schema, so a role nobody granted anything to
 //     does not reach the registry through the default.
-func registryPrivileges(appRole string) pgmigrate.Reconciler {
+func registryPrivileges(controlRole, appRole string) pgmigrate.Reconciler {
 	return pgmigrate.Reconciler{
 		Name: "registry-privileges",
 		Reconcile: func(ctx context.Context, tx pgmigrate.Tx) error {
+			if err := pgmigrate.EnsureRole(ctx, tx, controlRole); err != nil {
+				return err
+			}
 			if err := pgmigrate.EnsureRole(ctx, tx, appRole); err != nil {
+				return err
+			}
+			// Revoke any registry privileges an older deployment granted to
+			// the data role. Re-running only the new grant would leave the
+			// pre-split privileges in place on an upgrade, which is exactly
+			// the state the split exists to prevent.
+			quotedAppRole := pgx.Identifier{appRole}.Sanitize()
+			if _, err := tx.Exec(ctx, "REVOKE ALL PRIVILEGES ON TABLE "+Schema+".pools, "+Schema+".tenants FROM "+quotedAppRole); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, "REVOKE ALL PRIVILEGES ON SCHEMA "+Schema+" FROM "+quotedAppRole); err != nil {
 				return err
 			}
 
@@ -284,7 +320,7 @@ func registryPrivileges(appRole string) pgmigrate.Reconciler {
 
 			return pgmigrate.AssertPrivileges(ctx, tx, pgmigrate.Privileges{
 				Schema:      Schema,
-				Role:        appRole,
+				Role:        controlRole,
 				SchemaUsage: true,
 				Tables: []pgmigrate.TablePrivileges{
 					{Table: "pools", Grant: readWrite, Revoke: revoked},
@@ -316,8 +352,9 @@ func mapErr(what string, err error) error {
 // module is ever handed, so the configuration carrying it must not render it
 // — see CONVENTIONS.md's "Rendering a secret".
 func (c Config) String() string {
-	return fmt.Sprintf("tenancy.MigrateConfig{DSN: %s, AppRole: %q, Postgres: %+v}",
-		c.DSN, c.AppRole, c.Postgres)
+	return fmt.Sprintf("tenancy.MigrateConfig{DSN: %s, AppRole: %q, ControlRole: %q, Postgres: {MaxConns: %d, MinConns: %d, ConnectTimeout: %s, ApplicationName: %q}}",
+		c.DSN, c.AppRole, c.ControlRole, c.Postgres.MaxConns, c.Postgres.MinConns,
+		c.Postgres.ConnectTimeout, c.Postgres.ApplicationName)
 }
 
 // Format implements fmt.Formatter, the only interface fmt consults for every
@@ -333,5 +370,6 @@ func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("dsn", domain.Redacted),
 		slog.String("app_role", c.AppRole),
+		slog.String("control_role", c.ControlRole),
 	)
 }

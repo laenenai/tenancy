@@ -1,0 +1,35 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard"
+  ],
+  "rangeStrategy": "bump",
+  "packageRules": [
+    {
+      "matchManagers": ["gomod"],
+      "groupName": "Go dependencies"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "matchDatasources": ["docker"],
+      "groupName": "Container images"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": [
+        "^testdb/testdb\\.go$",
+        "^credentials/openbao/testbao_test\\.go$"
+      ],
+      "matchStrings": [
+        "(?<depName>[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+):(?<currentValue>[a-zA-Z0-9_.-]+)(?:@(?<currentDigest>sha256:[a-f0-9]+))?"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ]
+}

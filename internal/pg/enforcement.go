@@ -31,6 +31,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -49,13 +50,26 @@ import (
 // against a schema whose policy does nothing.
 const RLSViolationCode = "42501"
 
-// IsRLSViolation reports whether err is Postgres refusing a statement
-// under a row-level-security policy's WITH CHECK.
-//
-// It deliberately does not accept every error: see RLSViolationCode.
-func IsRLSViolation(err error) bool {
+// IsInsufficientPrivilege reports whether err is Postgres refusing a
+// statement for lack of privilege. SQLSTATE 42501 covers both a missing
+// grant and a row-level-security policy refusal, so this predicate is
+// deliberately broad.
+func IsInsufficientPrivilege(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == RLSViolationCode
+}
+
+// IsRLSPolicyViolation reports whether err is specifically a row-level
+// security policy refusal, not a missing grant or another 42501. Use this
+// when a test or startup check must prove the policy did the refusing.
+func IsRLSPolicyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != RLSViolationCode {
+		return false
+	}
+	msg := strings.ToLower(pgErr.Message)
+	return strings.Contains(msg, "row-level security") || strings.Contains(msg, "row level security") ||
+		strings.Contains(msg, "policy")
 }
 
 // Enforcement is what Postgres will actually do to a tenant-scoped
@@ -132,32 +146,52 @@ type TableEnforcement struct {
 	// RowSecurityForced is pg_class.relforcerowsecurity. Without it the
 	// table's owner is exempt from its own policy.
 	RowSecurityForced bool
-	// PolicyPresent reports whether a policy named TenantPolicyName exists
-	// on the table.
+	// PolicyPresent reports whether a restrictive policy named
+	// TenantPolicyName exists on the table.
 	PolicyPresent bool
-	// OwnedByRole reports whether Enforcement.Role owns this table. An
-	// owner is exempt from row security unless RowSecurityForced.
+	// AccessPolicyPresent reports whether at least one permissive policy
+	// exists. Without one, PostgreSQL denies every row: fail-closed but
+	// non-functional.
+	AccessPolicyPresent bool
+	// PolicyHasCheck reports whether the tenant policy has a WITH CHECK
+	// expression, which is what refuses a cross-tenant INSERT/UPDATE.
+	PolicyHasCheck bool
+	// PolicyMatchesPredicate reports whether the tenant policy's USING
+	// expression looks like TenantPredicate. It is a text check, not a
+	// proof; the conformance suite's behavioural subtests remain the proof.
+	PolicyMatchesPredicate bool
+	// OwnedByRole reports whether Enforcement.Role owns this table. An owner
+	// can disable row security or drop the policy even when FORCE is set, so
+	// this is a finding regardless of RowSecurityForced.
 	OwnedByRole bool
 }
 
 // FailClosed reports whether a cross-tenant statement through this handle
 // would actually be refused: no bypass on the role, no residual context,
-// and every table enabled, FORCEd and carrying the policy.
+// and every table enabled, FORCEd, owned by a separate role, carrying a
+// restrictive tenant policy with a matching predicate and WITH CHECK, and a
+// permissive companion.
 //
 // It is derived from Findings rather than stored, so there is no way for
 // the verdict and the reasons to disagree.
-func (e Enforcement) FailClosed() bool { return len(e.Findings()) == 0 }
+func (e Enforcement) FailClosed() bool {
+	return e.Role != "" && len(e.Tables) > 0 && len(e.Findings()) == 0
+}
 
 // CheckEnforcement probes what Postgres will do to statements this handle
 // runs against each of tables (each given as "schema.table").
 //
-// It opens two transactions on the handle's own pool: one scoped exactly
-// as Tx scopes, to read the effective role and the catalog as that role
-// sees it, and one unscoped, to measure ResidualTenantContext. Both are
-// rolled back.
+// It opens two transactions on the handle's own pool: one scoped exactly as
+// Tx scopes, to read the effective role and the catalog as that role sees it,
+// and one unscoped, to measure ResidualTenantContext. The scoped probe commits
+// (it is read-only and returns nil); the residual probe rolls back. The scoped
+// commit is deliberate: it exercises the same commit path a caller's Tx uses.
 func (s Scoped) CheckEnforcement(ctx context.Context, tables ...string) (Enforcement, error) {
 	if !s.Valid() {
 		return Enforcement{}, fmt.Errorf("%w: this handle was not produced by resolving a tenant", domain.ErrNoTenantScope)
+	}
+	if len(tables) == 0 {
+		return Enforcement{}, fmt.Errorf("%w: CheckEnforcement needs at least one table; an empty list cannot report fail-closed", domain.ErrInvalidConfig)
 	}
 
 	out := Enforcement{}
@@ -225,13 +259,31 @@ func tableEnforcement(ctx context.Context, tx TenantTx, table string) (TableEnfo
 		       pg_get_userbyid(c.relowner) = current_user,
 		       EXISTS (
 		           SELECT 1 FROM pg_policy p
-		           WHERE p.polrelid = c.oid AND p.polname = $2
+		           WHERE p.polrelid = c.oid AND p.polname = $2 AND NOT p.polpermissive
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM pg_policy p
+		           WHERE p.polrelid = c.oid AND p.polname = $2 AND NOT p.polpermissive
+		             AND p.polwithcheck IS NOT NULL
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM pg_policy p
+		           WHERE p.polrelid = c.oid AND p.polname = $2 AND NOT p.polpermissive
+		             AND lower(coalesce(pg_get_expr(p.polqual, c.oid), '')) LIKE '%tenant_id%'
+		             AND lower(coalesce(pg_get_expr(p.polqual, c.oid), '')) LIKE '%nullif%'
+		             AND lower(coalesce(pg_get_expr(p.polqual, c.oid), '')) LIKE '%current_setting%'
+		             AND coalesce(pg_get_expr(p.polqual, c.oid), '') LIKE '%' || $3 || '%'
+		       ),
+		       EXISTS (
+		           SELECT 1 FROM pg_policy p
+		           WHERE p.polrelid = c.oid AND p.polpermissive
 		       ),
 		       row_security_active(c.oid)
 		FROM pg_class c
 		WHERE c.oid = to_regclass($1)
-	`, table, TenantPolicyName).Scan(
+	`, table, TenantPolicyName, TenantGUC).Scan(
 		&out.RowSecurityEnabled, &out.RowSecurityForced, &out.OwnedByRole, &out.PolicyPresent,
+		&out.PolicyHasCheck, &out.PolicyMatchesPredicate, &out.AccessPolicyPresent,
 		&out.RowSecurityActive,
 	)
 	switch {
@@ -306,11 +358,18 @@ func (e Enforcement) Findings() []string {
 		case !t.RowSecurityEnabled:
 			out = append(out, t.Table+" does not have row-level security enabled, so its tenant isolation is application-level only")
 		case !t.PolicyPresent:
-			out = append(out, t.Table+" has row-level security enabled but carries no "+TenantPolicyName+
+			out = append(out, t.Table+" has row-level security enabled but carries no restrictive "+TenantPolicyName+
 				" policy: Postgres default-denies every statement against it")
-		case !t.RowSecurityForced && t.OwnedByRole:
+		case !t.PolicyHasCheck:
+			out = append(out, t.Table+" has a "+TenantPolicyName+" policy with no WITH CHECK, so cross-tenant writes are not refused")
+		case !t.PolicyMatchesPredicate:
+			out = append(out, t.Table+" has a "+TenantPolicyName+" policy whose expression does not look like "+TenantPredicate+
+				"; a policy with the right name can still permit every row")
+		case !t.AccessPolicyPresent:
+			out = append(out, t.Table+" has only restrictive policies and no permissive companion, so Postgres denies every row")
+		case t.OwnedByRole:
 			out = append(out, t.Table+" is owned by "+e.Role+
-				" and its row security is not FORCEd, so the policy does not bind the role that runs the statements")
+				"; a table owner can disable row security or drop the policy even when FORCE is set, so tenant tables must be owned by a separate role")
 		case !t.RowSecurityForced:
 			out = append(out, t.Table+" does not have row-level security FORCEd, so its owner is exempt from its own policy")
 		case !t.RowSecurityActive:

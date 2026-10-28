@@ -73,7 +73,7 @@ const (
 // adapters, and the one the 2026-10-23 spike measured against. The version is
 // exact: a floating tag would make a green run say nothing about what it ran
 // against.
-const baoImage = "openbao/openbao:2.2.1"
+const baoImage = "openbao/openbao:2.2.1@sha256:62f582f85e405ef00d48f678c19863d096a2bc0c05e0e5a9bbccd676a1c7316c"
 
 // devRootToken is the root token of the dev-mode server this harness starts.
 // It is a test fixture for an ephemeral container that lives for one test

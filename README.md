@@ -6,11 +6,11 @@
 Who the tenants are, where their data lives, and a pgx connection already
 scoped to exactly one of them — failing closed if it is not.
 
-> **Status: implemented, unreleased.** The registry, resolution, both
-> connection kinds, the credentials port with both its adapters, and the two
-> conformance suites are here and green against a real Postgres and a real
-> OpenBao. No tag yet, and no consumer has swapped over: `cas` keeps its own
-> copy of the extracted code until the post-alpha swap.
+> **Status: pre-1.0.** Tags `v0.1.0`, `v0.2.0` and `v0.3.0` exist; `main` is
+> newer and unreleased. Minor versions may break the API, and the
+> [`CHANGELOG`](CHANGELOG.md) plus [`UPGRADING`](UPGRADING.md) say what
+> changed. The API is not frozen until the P0/P1 work in
+> [`docs/review/20261028_review.md`](docs/review/20261028_review.md) is done.
 
 ## What it does
 
@@ -24,22 +24,28 @@ leak:
 - **Control plane.** Resolving tenant → pool happens *before* any tenant scope
   exists, so it necessarily runs unscoped against the registry. This path is
   small, auditable, and must never be reachable with caller-supplied
-  predicates.
+  predicates. Its login role is a member of the registry's **control role**.
 - **Data plane.** Every other connection is scoped to one resolved tenant with
   RLS session context set, and a missing predicate **denies rather than
-  leaking**.
+  leaking**. Its login role is a member of the **data role** (`AppRole`), which
+  has no registry privileges.
 
-The type system should make it impossible to run a data-plane query on a
-control-plane handle.
+The two roles are deliberately different. `tenancy.Migrate` creates both as
+`NOLOGIN` grantees; your deployment creates the `LOGIN` identities and makes
+each a member of the appropriate grantee. A runtime control login with
+`INHERIT` membership in `ControlRole` can read the registry; the data role
+cannot.
 
 A connection string is a credential, so `tenancy.DSN` is its own type rather
-than a `string`: it redacts itself through every rendering Go offers — `%v`,
-`%+v`, `%#v`, every other `fmt` verb, `json.Marshal`, and `slog` under both
-standard handlers — and reading the actual string requires writing
-`string(dsn)`, which is a deliberate act at a boundary rather than the
-accidental default. `Pool`, `Config`, `MigrateConfig`, `NewPool` and `Scoped`
-carry the same four methods, because a redacting field type protects a
-struct's *exported* fields and nothing reached through an unexported one.
+than a `string`: it redacts itself through the four interfaces Go's common
+renderers consult — `fmt.Stringer`/`fmt.Formatter` (`%v`, `%+v`, `%#v` and every
+other verb), `json.Marshaler`, `slog.LogValuer`, and `encoding.TextMarshaler`
+for YAML/XML — and reading the actual string requires writing `string(dsn)`,
+which is a deliberate act at a boundary rather than the accidental default.
+`%p` and bad-verb mismatches bypass those interfaces; the material stays
+unexported so reflection does not reach it. `Pool`, `PoolRef`, `Config`,
+`MigrateConfig`, `PoolSpec`, `Scoped` and `Credential` carry the same
+redaction methods.
 
 ## Why it is shared code rather than a convention
 
@@ -48,72 +54,139 @@ fail-closed backstop behind application-level scoping, which makes it a
 cross-tenant disclosure control. Three independent implementations of a
 cross-tenant disclosure control are three chances to fail silently.
 
+**RLS threat model.** Application-level scoping is primary; RLS is a backstop
+against a forgotten predicate or a bug in application code. It is **not**
+containment for SQL injection or for a role that can run DDL: a caller that can
+execute arbitrary SQL can reset `app.tenant_id`, and a table owner can disable
+RLS or drop the policy. Deploy the data role as a non-owner, no-DDL role, and
+do not treat RLS as a substitute for parameterized SQL. See
+[`THREAT_MODEL.md`](THREAT_MODEL.md).
+
 ## What it does not do
 
 Authorization rules, key material, migrations beyond its own registry tables,
 query building, or any consuming system's domain concepts.
 
-## Using it
+## Install and first use
 
-```go
-// Once, at startup, on the migration credential. The handle never escapes.
-if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{
-    DSN:     tenancy.DSN(migrationDSN),
-    AppRole: "myapp",
-}); err != nil {
-    return err
-}
-
-// For the life of the process, on the runtime credential.
-ten, err := tenancy.Open(ctx, tenancy.Config{
-    RegistryDSN: tenancy.DSN(runtimeDSN),
-    AppRole:     "myapp",
-    Cache:       tenancy.CacheOptions{TTL: time.Minute, NegativeTTL: 10 * time.Second},
-})
-if err != nil {
-    return err
-}
-defer ten.Close()
-
-// Control plane: the registry. No method here takes SQL.
-pool, err := ten.Control().CreatePool(ctx, tenancy.NewPool{
-    Name: "eu-main", Region: "eu-west-1", MetadataDSN: tenancy.DSN(poolDSN),
-})
-
-// Data plane: one resolved tenant, with its session context already set.
-scoped, err := ten.Scope(ctx, tenantID)
-if err != nil {
-    return err // ErrNotAuthorizedOrNotFound, or ErrUnavailable if suspended
-}
-err = scoped.Tx(ctx, func(ctx context.Context, tx tenancy.TenantTx) error {
-    // tx satisfies sqlc's generated DBTX, so a consumer's own generated
-    // queries run tenant-scoped with no wrapper:
-    //     myqueries := gen.New(tx)
-    _, err := tx.Exec(ctx,
-        "INSERT INTO app.document (id, tenant_id, title) VALUES ($1, $2, $3)",
-        docID, tx.Tenant(), title)
-    return err
-})
+```bash
+go get github.com/laenenai/tenancy@latest
 ```
 
-A consumer's own tenant-scoped tables get the backstop by calling
-`tenancy.EnableRLS` from its own migration reconciler, and prove they have it
-by wiring `tenancy.AssertRLSCoverage` into a test. `Scoped.CheckEnforcement`
-reports whether Postgres will actually refuse a cross-tenant statement on
-this deployment's connection — call it at startup and refuse to serve if
-`FailClosed` is false, because a superuser connection makes every policy
-inert while looking entirely correct from Go.
+The quickstart is complete enough to compile and run:
+
+```go
+package main
+
+import (
+    "context"
+    "time"
+
+    "github.com/laenenai/tenancy"
+)
+
+func wire(ctx context.Context, migrationDSN, runtimeDSN string) error {
+    // Once, on the migration credential. The migration pool never escapes.
+    // AppRole is the data-plane grantee; ControlRole is the registry grantee.
+    if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{
+        DSN:         tenancy.DSN(migrationDSN),
+        AppRole:     "myapp_data",
+        ControlRole: "myapp_control",
+    }); err != nil {
+        return err
+    }
+
+    // Everything below runs as a LOGIN role that is a member of ControlRole
+    // (INHERIT). The data role is never this DSN.
+    ten, err := tenancy.Open(ctx, tenancy.Config{
+        RegistryDSN: tenancy.DSN(runtimeDSN),
+        AppRole:     "myapp_data",
+        Cache:       tenancy.CacheOptions{TTL: time.Minute, NegativeTTL: 10 * time.Second},
+    })
+    if err != nil {
+        return err
+    }
+    defer ten.Close()
+
+    // Control plane: the registry. No method here takes SQL.
+    pool, err := ten.Control().CreatePool(ctx, tenancy.PoolSpec{
+        Name: "eu-main", Region: "eu-west-1",
+        MetadataDSN: tenancy.DSN("postgres://myapp_data:...@pool-a/db"),
+        BlobConfigRef: "blob-eu-main", WorkerCapacity: 8,
+    })
+    if err != nil {
+        return err
+    }
+    tenant, err := ten.Control().CreateTenant(ctx, tenancy.TenantSpec{
+        PoolID: pool.ID, Name: "acme", SecurityMode: tenancy.SecurityModeManaged,
+    })
+    if err != nil {
+        return err
+    }
+
+    // Data plane: one resolved tenant. Pool() is a PoolRef and cannot leak
+    // MetadataDSN.
+    scoped, err := ten.Scope(ctx, tenant.ID)
+    if err != nil {
+        return err // ErrNotAuthorizedOrNotFound, or ErrUnavailable if suspended
+    }
+    return scoped.Tx(ctx, func(ctx context.Context, tx tenancy.TenantTx) error {
+        // tx satisfies sqlc's DBTX, so generated queries run tenant-scoped:
+        //     q := gen.New(tx)
+        _, err := tx.Exec(ctx,
+            "INSERT INTO app.document (id, tenant_id, title) VALUES ($1, $2, $3)",
+            "doc-1", tx.Tenant(), "Hello")
+        return err
+    })
+}
+```
+
+`ten.Control().SetTenantStatus` invalidates the positive cache for that tenant,
+so suspending or deleting an active tenant is visible on the next `Scope`
+without waiting for `TTL`. `deleting` is terminal; the schema trigger rejects a
+return to `active` or `suspended`.
+
+## RLS: two policies, not one
+
+A restrictive policy alone is not a working tenant policy: it also filters the
+registry and any other non-tenant row. `EnableRLS` creates a restrictive
+`tenant_isolation` policy **and** a permissive `tenant_access` companion. Both
+carry the same `USING`/`WITH CHECK` predicate. A consumer that writes its own
+policy must reproduce both.
+
+Call `AssertRLSCoverage` in CI, and `CheckEnforcement` at startup. Coverage
+requires enabled and FORCEd RLS, a restrictive tenant policy with a matching
+predicate and `WITH CHECK`, and a permissive companion. Ownership is reported
+even when FORCE is set, because an owner can still disable RLS or drop the
+policy. `CheckEnforcement` now requires at least one table; an empty list is a
+configuration error, not a pass.
+
+```go
+scoped, err := ten.Scope(ctx, tenantID)
+if err != nil {
+    return err
+}
+check, err := scoped.CheckEnforcement(ctx, "app.document")
+if err != nil {
+    return err
+}
+if !check.FailClosed() {
+    log.Fatalf("tenant enforcement is not real: %v", check.Findings())
+}
+```
+
+The registry's own tables are the named exception:
+`tenancy.RegistryTablesExemptFromRLS()` returns a copy of the exemption map, so
+mutating the returned map cannot weaken the sweep.
 
 ## Dynamic database credentials, if you want them
 
 By default a pool connects on the credential its registry row's
-`MetadataDSN` already carries: a long-lived password, shared by every process
-that resolves that pool, whose rotation is a fleet-wide event nothing
-announces. `tenancy.StaticDSNCredentials` is that default, it performs no
-I/O, and a deployment that wants nothing to change sets nothing.
+`MetadataDSN` already carries. `tenancy.StaticDSNCredentials` is that default;
+it performs no I/O, and a deployment that wants nothing to change sets nothing.
 
-The alternative is opt-in and never required: `credentials/openbao` issues a
-credential per pool from OpenBao's database secrets engine, with a lease.
+The alternative is opt-in: `credentials/openbao` issues a credential per pool
+from OpenBao's database secrets engine, with a lease.
 
 ```go
 source, err := openbao.Open(ctx, openbao.Config{
@@ -125,8 +198,6 @@ if err != nil {
     return err
 }
 
-// Worth doing at startup: it reads the role's configuration back and
-// reports every way it departs from what this module requires.
 if check, err := source.CheckRole(ctx, "myapp-runtime"); err != nil {
     return err
 } else if !check.Usable() {
@@ -135,57 +206,80 @@ if check, err := source.CheckRole(ctx, "myapp-runtime"); err != nil {
 
 ten, err := tenancy.Open(ctx, tenancy.Config{
     RegistryDSN: tenancy.DSN(runtimeDSN),
+    AppRole:     "myapp_data",
     Credentials: source,
-    Cache: tenancy.CacheOptions{
-        TTL:         time.Minute,
-        NegativeTTL: 10 * time.Second,
-        // Required with Credentials, and it is a fact about your slowest
-        // query rather than a security preference. See below.
-        LongestTransaction: 2 * time.Minute,
-    },
+    LongestTransaction: 2 * time.Minute, // required with Credentials
+    Cache: tenancy.CacheOptions{TTL: time.Minute, NegativeTTL: 10 * time.Second},
 })
 ```
 
-Configure the OpenBao role's `creation_statements` from
-`openbao.CreationStatements("myapp")` rather than from a copy of some SQL.
-Every clause in it is load-bearing, and three of them are load-bearing in
-ways that do not show up until something has already gone wrong.
+`Open` accepts HTTPS, or plain HTTP only on loopback. URL userinfo, query and
+fragment are rejected, and a cross-host or downgrade redirect is not followed,
+so the vault token cannot be forwarded to another host. Configure the OpenBao
+role's `creation_statements` from `openbao.CreationStatements("myapp_data")`;
+mixed-case roles are quoted.
 
 **What changes, and what it costs.** A credential that expires cannot be
-swapped underneath a live `*pgxpool.Pool`: expiry is a privilege removal
-rather than a disconnection, so nothing closes, the pool reports itself
-healthy, and a transaction that was already running fails mid-statement and
-then has its `COMMIT` silently turned into a `ROLLBACK`. So each pool is
-*retired* one `LongestTransaction` before its credential expires: it stops
-being handed to new callers, the transactions already on it drain, it closes,
-and a replacement is built on a fresh credential. That lead time is a drain
-window, which is why it is required rather than defaulted, and why a
-credential with less than twice that left to live is refused with both
-numbers named.
+swapped underneath a live `*pgxpool.Pool`. Each pool is *retired* one
+`LongestTransaction` before its credential expires: it stops being handed to
+new callers, the transactions already on it drain, it closes, and a replacement
+is built on a fresh credential. A credential with less than twice that left to
+live is refused with both numbers named. Release is best-effort and uses a
+detached timeout; failed releases are counted and can be observed through
+`OnCredentialReleaseError` or `ten.Stats()`.
 
-It applies to tenant pools only. The control plane's own pool and the
-migration pool keep their static DSNs — neither is reference counted, so
-there is no moment at which replacing one is known to be safe.
-
-The measurements behind all of this, including why OpenBao's *static* roles
-are refused rather than supported, are in
-[`credentials/openbao`](credentials/openbao/openbao.go)'s package doc and in
-[the spike](docs/superpowers/spikes/2026-10-23-openbao-db-credentials.md).
+It applies to tenant pools only. The control-plane pool and the migration pool
+keep their static DSNs.
 
 ## The test harness
 
-`tenancy/testdb` is the shared container harness the other modules import
-(`CONVENTIONS.md` makes this module its home). `testdb.Start(t)` gives a test
-its own uniquely named, migrated database, skips under `-short`, and uses
-`TEST_DATABASE_URL` instead of a container when that is set. It is public
-surface and listed in `api.txt`.
+`tenancy/testdb` is the shared container harness the other modules import. It
+is a nested module, so the root module does not carry testcontainers; until a
+`testdb/vX.Y.Z` tag is published, consume it with a `replace` to the checkout.
+`testdb.Start(t)` gives a test its own uniquely named, **empty** database and
+skips under `-short`. It does **not** run `tenancy`'s migrations by default; a
+consumer that wants them passes `testdb.WithMigrator(...)`. `TEST_DATABASE_URL`
+replaces the container.
+
+```go
+db := testdb.Start(t, testdb.WithMigrator(func(ctx context.Context, dsn tenancy.DSN) error {
+    return tenancy.Migrate(ctx, tenancy.MigrateConfig{
+        DSN: dsn, AppRole: "test_data", ControlRole: "test_control",
+    })
+}))
+```
+
+## Development
+
+`mise` is the single source of truth for tool versions and tasks:
+
+```bash
+mise install
+mise run fmt
+mise run test          # no containers
+mise run test-all      # race + containers
+mise run check         # fmt, lint, build, test-all, sqlc diff, govulncheck, api-diff
+```
+
+## Examples
+
+[`examples/`](examples/) contains compile-checked adoption paths:
+
+- [`quickstart`](examples/quickstart/) — migrate, open, resolve, run one scoped statement
+- [`rls`](examples/rls/) — apply and verify the two-policy RLS backstop
+- [`openbao`](examples/openbao/) — dynamic credentials and lease retirement
+- [`roles`](examples/roles/) — control/data role split and least privilege
+- [`testing`](examples/testing/) — the shared harness and conformance suites
 
 ## Documentation
 
-- [`CHARTER.md`](CHARTER.md) — the boundary, and the recorded decisions open to reversal
-- [`docs/superpowers/spikes/`](docs/superpowers/spikes/) — what was measured rather than assumed
-- [`SECURITY.md`](SECURITY.md)
-- `api.txt` — the public surface as a golden file, diffed in CI
+- [`CHARTER.md`](CHARTER.md) — the boundary and recorded decisions
+- [`CONVENTIONS.md`](CONVENTIONS.md) — the shared Go conventions
+- [`THREAT_MODEL.md`](THREAT_MODEL.md) — what RLS and the role split do and do not protect
+- [`SECURITY.md`](SECURITY.md) — reporting and supported versions
+- [`CHANGELOG.md`](CHANGELOG.md), [`UPGRADING.md`](UPGRADING.md) — release history and breaking changes
+- [`docs/superpowers/spikes/`](docs/superpowers/spikes/) — measured findings
+- `mise run api-diff` — the importable API diff against the last tag
 
 ## License
 

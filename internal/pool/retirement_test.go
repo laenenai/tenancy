@@ -70,7 +70,7 @@ func newFakeCredentials(ttl time.Duration, clock domain.Clock) *fakeCredentials 
 	return &fakeCredentials{ttl: ttl, clock: clock, poolFor: make(map[string]*pgxpool.Pool)}
 }
 
-func (f *fakeCredentials) Issue(_ context.Context, _ domain.Pool) (domain.Credential, error) {
+func (f *fakeCredentials) Issue(_ context.Context, _ domain.PoolRef) (domain.Credential, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -183,11 +183,9 @@ func retirementFixture(t *testing.T, ttl, lead time.Duration) (*pool.CachingReso
 	reg.setTenant(activeTenant(tenantID, poolID))
 
 	r := pool.NewResolver(reg, retirementOpener(creds), pool.Options{
-		TTL:                time.Hour,
-		NegativeTTL:        time.Hour,
-		Clock:              clock,
-		Credentials:        creds,
-		LongestTransaction: lead,
+		TTL: time.Hour, NegativeTTL: time.Hour,
+	}, pool.LifecycleOptions{
+		Clock: clock, Credentials: creds, LongestTransaction: lead,
 	})
 	t.Cleanup(func() { _ = r.Close() })
 
@@ -428,6 +426,7 @@ func TestClose_HandsBackEveryCredentialConcurrently(t *testing.T) {
 
 	r := pool.NewResolver(reg, retirementOpener(creds), pool.Options{
 		TTL: time.Hour, NegativeTTL: time.Hour,
+	}, pool.LifecycleOptions{
 		Clock: clock, Credentials: creds, LongestTransaction: time.Minute,
 	})
 
@@ -462,5 +461,57 @@ func TestClose_HandsBackEveryCredentialConcurrently(t *testing.T) {
 
 	if _, released := creds.counts(); released != 2 {
 		t.Errorf("%d credentials were handed back on shutdown, want 2", released)
+	}
+}
+
+func TestClose_WaitsForAnInFlightBackgroundClose(t *testing.T) {
+	clock := domain.NewFixedClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
+	creds := newFakeCredentials(time.Hour, clock)
+	creds.releaseGate = make(chan struct{})
+
+	reg := newFakeRegistry()
+	poolA := domain.NewPoolID(clock)
+	poolB := domain.NewPoolID(clock)
+	tenantA := domain.NewTenantID(clock)
+	tenantB := domain.NewTenantID(clock)
+	reg.setPool(testPool(poolA, fakeDSN("close-a")))
+	reg.setPool(testPool(poolB, fakeDSN("close-b")))
+	reg.setTenant(activeTenant(tenantA, poolA))
+	reg.setTenant(activeTenant(tenantB, poolB))
+
+	r := pool.NewResolver(reg, retirementOpener(creds), pool.Options{
+		TTL: time.Hour, NegativeTTL: time.Hour, MaxPools: 1,
+	}, pool.LifecycleOptions{Clock: clock, Credentials: creds, LongestTransaction: time.Minute})
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	mustResolve(ctxA, t, r, tenantA)
+	mustResolve(context.Background(), t, r, tenantB) // evicts A
+	cancelA()                                        // A's last borrow release starts a background close
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		creds.mu.Lock()
+		inFlight := creds.inFlight
+		creds.mu.Unlock()
+		if inFlight > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the background close did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- r.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned while a background close was still blocked: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(creds.releaseGate)
+	if err := <-closed; err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

@@ -139,6 +139,9 @@ func Open(ctx context.Context, dsn domain.DSN, cfg PoolConfig) (*pgxpool.Pool, e
 // is what stops a credential issuer being able to point a tenant's traffic at
 // a database of its own choosing.
 func OpenAs(ctx context.Context, dsn domain.DSN, cred domain.Credential, cfg PoolConfig) (*pgxpool.Pool, error) {
+	if cfg.MaxConns > 0 && cfg.MinConns > cfg.MaxConns {
+		return nil, fmt.Errorf("%w: PoolConfig.MinConns must not exceed PoolConfig.MaxConns", domain.ErrInvalidConfig)
+	}
 	poolCfg, err := pgxpool.ParseConfig(string(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("%w: the connection string is not valid", domain.ErrInvalidConfig)

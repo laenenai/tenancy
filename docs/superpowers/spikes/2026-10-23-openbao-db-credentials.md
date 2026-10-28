@@ -4,6 +4,14 @@
 **Scripts:** [`2026-10-23-openbao-db-credentials/`](./2026-10-23-openbao-db-credentials/)
 **Transcripts:** [`2026-10-23-openbao-db-credentials/transcripts/`](./2026-10-23-openbao-db-credentials/transcripts/)
 
+> **Historical note (2026-10-28).** This spike records what was measured on
+> 2026-10-23. The current API has since split the control-plane and data-plane
+> roles (`ControlRole`/`AppRole`), added `PoolRef`, and uses two RLS policies
+> (restrictive `tenant_isolation` plus permissive `tenant_access`). The lease,
+> revocation, `VALID UNTIL`, static-role, and template measurements are still
+> the evidence behind `credentials/openbao`; the SQL snippets reflect the
+> spike's single-policy, single-role fixture, not the current API.
+
 Three questions the documentation does not answer, measured against a real
 OpenBao talking to a real Postgres. Every number below comes from a
 transcript in that directory; nothing is inferred from documentation.

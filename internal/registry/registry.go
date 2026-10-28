@@ -60,9 +60,10 @@ import (
 // it; a method called afterwards is refused with domain.ErrUnavailable
 // rather than panicking.
 type Control struct {
-	pool    *pgxpool.Pool
-	queries *gen.Queries
-	clock   domain.Clock
+	pool           *pgxpool.Pool
+	queries        *gen.Queries
+	clock          domain.Clock
+	onStatusChange func(domain.TenantID, domain.TenantStatus)
 }
 
 // Config is what Open needs to reach the registry.
@@ -111,6 +112,13 @@ func Open(ctx context.Context, cfg Config) (*Control, error) {
 	return &Control{pool: pool, queries: gen.New(pool), clock: clock}, nil
 }
 
+// SetTenantStatusObserver installs the callback invoked after a successful
+// status change. The composition layer uses it to invalidate the resolver's
+// positive cache immediately; a Control used standalone may leave it nil.
+func (c *Control) SetTenantStatusObserver(fn func(domain.TenantID, domain.TenantStatus)) {
+	c.onStatusChange = fn
+}
+
 // Close releases the control-plane connection pool. It is idempotent.
 func (c *Control) Close() {
 	if c.pool != nil {
@@ -118,9 +126,9 @@ func (c *Control) Close() {
 	}
 }
 
-// NewPool is the input to CreatePool: everything about a pool that is not
+// PoolSpec is the input to CreatePool: everything about a pool that is not
 // derived.
-type NewPool struct {
+type PoolSpec struct {
 	// ID, when empty, is minted from the configured clock. A caller
 	// supplies one only when it is reconstructing a known pool.
 	ID domain.PoolID
@@ -138,8 +146,8 @@ type NewPool struct {
 	WorkerCapacity int
 }
 
-// NewTenant is the input to CreateTenant.
-type NewTenant struct {
+// TenantSpec is the input to CreateTenant.
+type TenantSpec struct {
 	// ID, when empty, is minted from the configured clock.
 	ID domain.TenantID
 	// PoolID names the pool that will host this tenant's metadata. It
@@ -158,9 +166,13 @@ type NewTenant struct {
 }
 
 // CreatePool registers a pool.
-func (c *Control) CreatePool(ctx context.Context, in NewPool) (domain.Pool, error) {
+func (c *Control) CreatePool(ctx context.Context, in PoolSpec) (domain.Pool, error) {
 	if in.ID == "" {
-		in.ID = domain.NewPoolID(c.clock)
+		id, err := domain.NewPoolIDErr(c.clock)
+		if err != nil {
+			return domain.Pool{}, err
+		}
+		in.ID = id
 	} else if _, err := domain.ParsePoolID(string(in.ID)); err != nil {
 		// A write boundary, so ErrMalformedID is the honest answer: the
 		// caller is supplying a new id, not asking the registry to resolve
@@ -179,6 +191,10 @@ func (c *Control) CreatePool(ctx context.Context, in NewPool) (domain.Pool, erro
 	}
 	if in.WorkerCapacity < 0 {
 		return domain.Pool{}, fmt.Errorf("%w: registry: worker capacity must not be negative", domain.ErrInvalidConfig)
+	}
+	const maxInt32 = int(^uint32(0) >> 1)
+	if in.WorkerCapacity > maxInt32 {
+		return domain.Pool{}, fmt.Errorf("%w: registry: worker capacity %d exceeds the PostgreSQL integer range", domain.ErrInvalidConfig, in.WorkerCapacity)
 	}
 
 	row, err := c.queries.CreatePool(ctx, gen.CreatePoolParams{
@@ -226,9 +242,13 @@ func (c *Control) PoolByName(ctx context.Context, name string) (domain.Pool, err
 }
 
 // CreateTenant registers a tenant in a pool that must already exist.
-func (c *Control) CreateTenant(ctx context.Context, in NewTenant) (domain.Tenant, error) {
+func (c *Control) CreateTenant(ctx context.Context, in TenantSpec) (domain.Tenant, error) {
 	if in.ID == "" {
-		in.ID = domain.NewTenantID(c.clock)
+		id, err := domain.NewTenantIDErr(c.clock)
+		if err != nil {
+			return domain.Tenant{}, err
+		}
+		in.ID = id
 	} else if _, err := domain.ParseTenantID(string(in.ID)); err != nil {
 		return domain.Tenant{}, err
 	}
@@ -312,6 +332,9 @@ func (c *Control) SetTenantStatus(ctx context.Context, id domain.TenantID, statu
 	if err != nil {
 		return domain.Tenant{}, mapErr("set tenant status", err)
 	}
+	if c.onStatusChange != nil {
+		c.onStatusChange(id, status)
+	}
 	return c.tenantFrom(row), nil
 }
 
@@ -363,36 +386,36 @@ func mapErr(what string, err error) error {
 		case "23503": // foreign_key_violation: a tenant naming a pool that does not exist
 			return fmt.Errorf("%w: %s: the pool it refers to does not exist", domain.ErrConflict, what)
 		case "23514": // check_violation: a value outside a closed set reached the column
-			return fmt.Errorf("%w: %s: a value was rejected by the schema's own constraint", domain.ErrConflict, what)
-		case "P0001": // raise_exception: the security_mode immutability trigger
+			return fmt.Errorf("%w: %s: a value was rejected by the schema's own constraint", domain.ErrInvalidConfig, what)
+		case "P0001": // raise_exception: the security_mode or status-transition trigger
 			return fmt.Errorf("%w: %s: the schema refused the change", domain.ErrConflict, what)
 		case "42501": // insufficient_privilege
-			return fmt.Errorf("%w: %s: the control plane's role does not hold the privilege for this statement", domain.ErrUnavailable, what)
+			return fmt.Errorf("%w: %s: the role does not hold the privilege for this statement", domain.ErrPermission, what)
 		}
 	}
 
 	return fmt.Errorf("%w: %s", domain.ErrUnavailable, what)
 }
 
-// String names the pool being created and redacts its MetadataDSN. NewPool is
+// String names the pool being created and redacts its MetadataDSN. PoolSpec is
 // the value a consumer builds by hand and is therefore the value most likely
 // to appear in its own logging around CreatePool — see CONVENTIONS.md's
 // "Rendering a secret".
-func (in NewPool) String() string {
-	return fmt.Sprintf("tenancy.NewPool{ID: %s, Name: %q, Region: %q, MetadataDSN: %s, BlobConfigRef: %q, WorkerCapacity: %d}",
+func (in PoolSpec) String() string {
+	return fmt.Sprintf("tenancy.PoolSpec{ID: %s, Name: %q, Region: %q, MetadataDSN: %s, BlobConfigRef: %q, WorkerCapacity: %d}",
 		in.ID, in.Name, in.Region, in.MetadataDSN, in.BlobConfigRef, in.WorkerCapacity)
 }
 
 // Format implements fmt.Formatter, the only interface fmt consults for every
 // verb.
-func (in NewPool) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, in.String()) }
+func (in PoolSpec) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, in.String()) }
 
 // MarshalJSON renders the same summary as a JSON string.
-func (in NewPool) MarshalJSON() ([]byte, error) { return json.Marshal(in.String()) }
+func (in PoolSpec) MarshalJSON() ([]byte, error) { return json.Marshal(in.String()) }
 
 // LogValue renders the request as a slog group with the metadata DSN
 // redacted.
-func (in NewPool) LogValue() slog.Value {
+func (in PoolSpec) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("pool_id", string(in.ID)),
 		slog.String("name", in.Name),

@@ -1,19 +1,14 @@
 # Toolchain and tasks for a shared laenen-ai module.
 #
-# Derived from cas/mise.toml but deliberately NOT a copy: cas's migrate, dev,
-# up, down, reset, db and observability tasks reference ./cmd/casd and
-# deploy/compose/, neither of which exists in a library module, and its
-# `generate` task runs sqlc and buf against nothing. A task list with dangling
-# entries trains people to ignore task lists.
-#
-# A module that later grows migrations or generated code adds the task it
-# actually needs, with the same name and meaning cas uses.
+# This file is the single source of tool versions. CI installs mise and runs
+# `mise run check`; it does not pin gofumpt, golangci-lint or sqlc a second
+# time in workflow YAML.
 
 [tools]
-go            = "1.25.6"
-golangci-lint = "2.11.4"
+go            = "1.27.3"
+golangci-lint = "2.15.0"
 sqlc          = "1.30.0"
-gofumpt       = "0.9.2"
+gofumpt       = "0.12.0"
 
 [env]
 CGO_ENABLED = "0"
@@ -34,43 +29,42 @@ description = "Inner loop: no containers, no databases. Skips at run time, never
 # asserted by tests whose inputs the cache considered unchanged, so nothing
 # re-ran. The inner loop is fast enough that the cache buys nothing worth
 # that.
-run = "go test ./... -short -count=1"
+run = "go test ./... -short -count=1 && (cd integration && go test ./... -short -count=1) && (cd internal/pg/integration && go test ./... -short -count=1) && (cd credentials/openbao/integration && go test ./... -short -count=1) && (cd testdb && go test ./... -short -count=1)"
 
 [tasks.build]
 description = "Proves the shipped binary is cgo-free: inherits CGO_ENABLED=0 from [env]."
 run = "go build ./..."
 
 [tasks.test-all]
-description = "Full suite including container- and database-backed tests."
+description = "Full suite including container- and database-backed tests, with race detection and coverage."
 # CGO_ENABLED=0 is a *release* constraint (cgo-free, cross-compilable binary),
 # not a test constraint. The race detector needs cgo, and race detection is
 # worth more in tests than cgo-freedom is; the cgo-free property is verified by
 # the `build` task, which `check` also depends on.
 env = { CGO_ENABLED = "1" }
-# -count=1 for the same reason as the `test` task above.
-run = "go test ./... -race -count=1"
+# -count=1 for the same reason as the `test` task above. Coverage is collected
+# across packages so a test that only touches an internal package still counts.
+run = "go test ./... -race -coverpkg=github.com/laenenai/tenancy,github.com/laenenai/tenancy/credentials/openbao,github.com/laenenai/tenancy/tenancytest,github.com/laenenai/tenancy/internal/... -coverprofile=coverage-root.out -count=1 && (cd integration && go test ./... -race -coverpkg=github.com/laenenai/tenancy/... -coverprofile=../coverage-integration.out -count=1) && (cd internal/pg/integration && go test ./... -race -coverpkg=github.com/laenenai/tenancy/... -coverprofile=../../../coverage-pg.out -count=1) && (cd credentials/openbao/integration && go test ./... -race -coverpkg=github.com/laenenai/tenancy/... -coverprofile=../../../coverage-openbao.out -count=1) && (cd testdb && go test ./... -race -count=1) && python3 scripts/merge-coverage.py coverage-root.out coverage-integration.out coverage-pg.out coverage-openbao.out > coverage.out && go tool cover -func=coverage.out | tail -1"
 
 [tasks.generate]
 description = "Regenerate sqlc query code from db/queries against db/migrations."
-# Deliberately NOT guarded as `test -f sqlc.yaml && sqlc generate || echo ...`.
-# An earlier version was, and it was a hole in the gate: once a module has a
-# sqlc.yaml, the trailing `||` turns a *generation failure* into a task that
-# exits 0 while printing a reassuring message. A module with no queries yet has
-# no sqlc.yaml, and `sqlc generate` says so and fails — which is the correct
-# answer to "generate the thing that does not exist".
-#
-# sqlc is pinned in [tools] because generated code is committed and its header
-# records the version that produced it: an unpinned generator makes every
-# developer's `generate` a diff.
 run = "sqlc generate"
 
-[tasks.api]
-description = "Regenerate api.txt, the public-surface golden file the charter requires."
-# The golden file is checked by an ordinary test (api_test.go), which is why
-# there is no api-check task: `test` and `test-all` already verify it, so the
-# check cannot be forgotten. This task only rewrites it, deliberately.
-# A module with no api_test.go yet matches no test and this is a no-op.
-run = "go test . -run TestAPIGolden -update-api"
+[tasks.generate-check]
+description = "Fail if generated sqlc code or the query/schema inputs are stale."
+run = "sqlc diff"
+
+[tasks.vuln]
+description = "Report reachable Go vulnerabilities."
+run = "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./..."
+
+[tasks.api-diff]
+description = "Compare the importable API with the last root tag using apidiff."
+run = "bash scripts/api-diff.sh"
+
+[tasks.release-check]
+description = "Validate a clean release tree with gorelease (run from a clean checkout)."
+run = "go run golang.org/x/exp/cmd/gorelease@v0.0.0-20261014143641-f0251eb4aa3e -base=latest"
 
 [tasks.check]
-depends = ["fmt-check", "lint", "build", "test-all"]
+depends = ["fmt-check", "lint", "build", "test-all", "generate-check", "vuln", "api-diff"]

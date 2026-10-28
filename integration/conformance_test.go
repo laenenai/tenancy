@@ -35,6 +35,7 @@ func TestConformance(t *testing.T) {
 		return tenancytest.Deployment{
 			MigrationDSN: db.DSN(),
 			AppRole:      testdb.AppRole,
+			ControlRole:  testdb.ControlRole,
 		}
 	})
 }

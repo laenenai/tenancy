@@ -33,12 +33,11 @@ func fixedClock() tenancy.Clock {
 	return tenancy.NewFixedClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
 }
 
-func stubPool() tenancy.Pool {
-	return tenancy.Pool{
-		ID:          tenancy.NewPoolID(tenancy.SystemClock{}),
-		Name:        "pool-a",
-		Region:      "test",
-		MetadataDSN: tenancy.DSN("postgres://app:pw@127.0.0.1:1/metadata"),
+func stubPool() tenancy.PoolRef {
+	return tenancy.PoolRef{
+		ID:     tenancy.NewPoolID(tenancy.SystemClock{}),
+		Name:   "pool-a",
+		Region: "test",
 	}
 }
 
@@ -167,7 +166,7 @@ func TestCreationStatementsCarryEveryClauseThatIsLoadBearing(t *testing.T) {
 		`VALID UNTIL '{{expiration}}'`,
 		// Inheritance, which is how a policy written against the
 		// application role covers the ephemeral member.
-		`IN ROLE app_role`,
+		`IN ROLE "app_role"`,
 	} {
 		if !strings.Contains(stmt, want) {
 			t.Errorf("the creation statement does not contain %q:\n%s", want, stmt)
@@ -222,10 +221,10 @@ func TestIssueReadsTheCredentialAndItsLease(t *testing.T) {
 		t.Error("Issue did not carry the lease id through, so Release would have nothing to hand back")
 	}
 
-	// The expiry is the lease duration measured from the instant the answer
-	// arrived. A lease is a duration in seconds and nothing in the response
-	// says what it is relative to, so the only honest answer is the moment
-	// this process observed it.
+	// The expiry is the lease duration measured from the instant the request
+	// started. A lease is a duration in seconds and nothing in the response
+	// says what it is relative to; using the request start is deliberately
+	// conservative, so retirement is never later than the server's expiry.
 	if want := clock.Now(); !cred.IssuedAt.Equal(tenancy.CanonicalTime(want)) {
 		t.Errorf("IssuedAt = %s, want %s", cred.IssuedAt, want)
 	}
@@ -298,7 +297,7 @@ func TestIssueClassifiesFailuresByWhetherRetryingWouldHelp(t *testing.T) {
 		body   string
 		want   error
 	}{
-		{"a refused token", http.StatusForbidden, `{"errors":["permission denied"]}`, tenancy.ErrInvalidConfig},
+		{"a refused token", http.StatusForbidden, `{"errors":["permission denied"]}`, tenancy.ErrPermission},
 		{"a missing role", http.StatusNotFound, `{"errors":[]}`, tenancy.ErrInvalidConfig},
 		{"a refused request", http.StatusBadRequest, `{"errors":["unknown role"]}`, tenancy.ErrInvalidConfig},
 		{"a server error", http.StatusInternalServerError, `{"errors":["internal error"]}`, tenancy.ErrUnavailable},
@@ -335,7 +334,7 @@ func TestIssueUsesRoleForWhenItIsSet(t *testing.T) {
 	}`)
 	source := stub.source(t, openbao.Config{
 		Role: "ignored",
-		RoleFor: func(p tenancy.Pool) (string, error) {
+		RoleFor: func(p tenancy.PoolRef) (string, error) {
 			return "role-for-" + p.Name, nil
 		},
 	})
@@ -352,11 +351,11 @@ func TestIssueRefusesWhenRoleForCannotChooseARole(t *testing.T) {
 	t.Parallel()
 
 	stub := newStubServer(t, http.StatusOK, `{}`)
-	cases := map[string]func(tenancy.Pool) (string, error){
-		"RoleFor returns an error": func(tenancy.Pool) (string, error) {
+	cases := map[string]func(tenancy.PoolRef) (string, error){
+		"RoleFor returns an error": func(tenancy.PoolRef) (string, error) {
 			return "", errors.New("no role is configured for this region")
 		},
-		"RoleFor returns nothing": func(tenancy.Pool) (string, error) { return "", nil },
+		"RoleFor returns nothing": func(tenancy.PoolRef) (string, error) { return "", nil },
 	}
 
 	for name, roleFor := range cases {
@@ -611,5 +610,92 @@ func TestNoSuperuserFalsePositive(t *testing.T) {
 	}
 	if !check.Usable() {
 		t.Fatalf("a role that explicitly spells out the safe attributes is reported as unusable: %v", check.Findings())
+	}
+}
+
+func TestCreationStatementsQuoteAMixedCaseRole(t *testing.T) {
+	t.Parallel()
+
+	statements, err := openbao.CreationStatements("MyApp")
+	if err != nil {
+		t.Fatalf("CreationStatements: %v", err)
+	}
+	if !strings.Contains(statements[0], `IN ROLE "MyApp"`) {
+		t.Fatalf("mixed-case role was not quoted: %s", statements[0])
+	}
+}
+
+func TestOpenRejectsUnsafeAddresses(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{ //nolint:gosec // test fixtures, not credentials
+		"non-loopback http": "http://openbao.example:8200",
+		"userinfo":          "https://user:password@openbao.example:8200",
+		"query":             "https://openbao.example:8200?token=secret",
+		"fragment":          "https://openbao.example:8200#fragment",
+		"no scheme":         "openbao.example:8200",
+	}
+	for name, address := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := openbao.Open(context.Background(), openbao.Config{Address: address, Token: stubToken, Role: "app"})
+			if !errors.Is(err, tenancy.ErrInvalidConfig) {
+				t.Fatalf("Open(%q) error = %v, want ErrInvalidConfig", address, err)
+			}
+			if strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("Open error leaked address material: %v", err)
+			}
+		})
+	}
+}
+
+func TestOpenAllowsLoopbackHTTP(t *testing.T) {
+	t.Parallel()
+
+	stub := newStubServer(t, http.StatusOK, `{"data":{"keys":["app"]}}`)
+	source := stub.source(t, openbao.Config{Address: stub.srv.URL, Token: stubToken, Role: "app"})
+	if source == nil {
+		t.Fatal("Open returned nil source")
+	}
+}
+
+func TestRedirectDoesNotForwardTheTokenToAnotherHost(t *testing.T) {
+	t.Parallel()
+
+	var receivedToken bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Vault-Token") != "" {
+			receivedToken = true
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect) //nolint:gosec // deliberate redirect fixture
+	}))
+	defer origin.Close()
+
+	source, err := openbao.Open(context.Background(), openbao.Config{
+		Address: origin.URL, Token: stubToken, Role: "app",
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := source.Issue(context.Background(), stubPool()); err == nil {
+		t.Fatal("Issue followed a cross-host redirect, want an error")
+	}
+	if receivedToken {
+		t.Fatal("the vault token was forwarded to a different host")
+	}
+}
+
+func TestConfigStringRedactsAddressUserinfo(t *testing.T) {
+	t.Parallel()
+
+	cfg := openbao.Config{Address: "https://user:password@openbao.example:8200", Token: stubToken} //nolint:gosec // test fixture
+	rendered := fmt.Sprintf("%v %+v %#v", cfg, cfg, cfg)
+	if strings.Contains(rendered, "password") || strings.Contains(rendered, "user:") {
+		t.Fatalf("Config rendering leaked address userinfo: %s", rendered)
 	}
 }

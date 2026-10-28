@@ -57,6 +57,57 @@ type Pool struct {
 	CreatedAt time.Time
 }
 
+// PoolRef is the part of a pool row a data-plane caller may see: identity,
+// placement and capacity, but never MetadataDSN. It is the return type of
+// pg.Scoped.Pool and the argument to a Credentials source, so neither a
+// request handler nor a credential-extension implementation receives the
+// long-lived password that dynamic credentials are meant to remove from the
+// process.
+type PoolRef struct {
+	ID             PoolID
+	Name           string
+	Region         string
+	BlobConfigRef  string
+	WorkerCapacity int
+	CreatedAt      time.Time
+}
+
+// Ref returns the credential-free view of p.
+func (p Pool) Ref() PoolRef {
+	return PoolRef{
+		ID:             p.ID,
+		Name:           p.Name,
+		Region:         p.Region,
+		BlobConfigRef:  p.BlobConfigRef,
+		WorkerCapacity: p.WorkerCapacity,
+		CreatedAt:      p.CreatedAt,
+	}
+}
+
+// String renders the credential-free reference.
+func (p PoolRef) String() string {
+	return fmt.Sprintf("tenancy.PoolRef{ID: %s, Name: %q, Region: %q, BlobConfigRef: %q, WorkerCapacity: %d}",
+		p.ID, p.Name, p.Region, p.BlobConfigRef, p.WorkerCapacity)
+}
+
+// Format honours every fmt verb through String.
+func (p PoolRef) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, p.String()) }
+
+// MarshalJSON renders String, so a PoolRef embedded in a response cannot
+// accidentally grow a credential field later without updating this method.
+func (p PoolRef) MarshalJSON() ([]byte, error) { return json.Marshal(p.String()) }
+
+// LogValue is the structured-logging form.
+func (p PoolRef) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", string(p.ID)),
+		slog.String("name", p.Name),
+		slog.String("region", p.Region),
+		slog.String("blob_config_ref", p.BlobConfigRef),
+		slog.Int("worker_capacity", p.WorkerCapacity),
+	)
+}
+
 // String names the pool's id, name, region, blob configuration reference and
 // worker capacity, and redacts its MetadataDSN. Those first five fields are
 // the whole reason a pool row is worth logging; the sixth is a credential.

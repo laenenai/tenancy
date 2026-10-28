@@ -60,7 +60,7 @@ type Credentials interface {
 	// Issue returns the credential p's connections should authenticate
 	// with. The zero Credential means "connect as p.MetadataDSN already
 	// says, and never retire the pool for credential age".
-	Issue(ctx context.Context, p Pool) (Credential, error)
+	Issue(ctx context.Context, p PoolRef) (Credential, error)
 	// Release hands cred back to whatever issued it. It is best-effort;
 	// see the interface comment. Releasing the zero Credential is a no-op
 	// and must not be an error.
@@ -172,6 +172,11 @@ func (c Credential) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, c.Str
 // issued password verbatim.
 func (c Credential) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
 
+// MarshalText renders the same summary for encoding.TextMarshaler-based
+// serializers (including YAML and XML), which otherwise reach the exported
+// Password and LeaseID fields directly.
+func (c Credential) MarshalText() ([]byte, error) { return []byte(c.String()), nil }
+
 // LogValue renders the credential as a slog group with the password and the
 // lease id redacted, so slog.Any("credential", c) is safe under every
 // handler.
@@ -247,7 +252,7 @@ func renderInstant(t time.Time) string {
 type StaticDSNCredentials struct{}
 
 // Issue returns the zero Credential: connect as the pool row says.
-func (StaticDSNCredentials) Issue(context.Context, Pool) (Credential, error) {
+func (StaticDSNCredentials) Issue(context.Context, PoolRef) (Credential, error) {
 	return Credential{}, nil
 }
 

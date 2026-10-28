@@ -100,8 +100,8 @@ func TestEnableRLS_ErrorsNeverForwardRawPostgresText(t *testing.T) {
 	if err == nil {
 		t.Fatal("EnableRLS on a nonexistent table succeeded")
 	}
-	if !errors.Is(err, domain.ErrUnavailable) {
-		t.Fatalf("error = %v, want it to wrap ErrUnavailable", err)
+	if !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("error = %v, want it to wrap ErrInvalidConfig for a missing table", err)
 	}
 	if !strings.Contains(err.Error(), "rlsfixture.does_not_exist") {
 		t.Errorf("error = %v, want it to name the table the caller asked about", err)

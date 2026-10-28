@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/laenenai/pgmigrate"
 
@@ -73,13 +74,24 @@ type Config struct {
 	Postgres pg.PoolConfig
 
 	// Cache configures tenant→pool resolution caching. Read
-	// pool.Options's doc comment before setting MaxPools and MaxTenants:
-	// a zero value means something different for each, on purpose.
+	// pool.Options's doc comment before setting MaxPools and MaxTenants.
 	Cache pool.Options
 
-	// Clock reads "now" for minted ids, canonicalized timestamps and
-	// cache expiry. Zero means domain.SystemClock.
+	// LongestTransaction is the longest a single transaction on a tenant
+	// pool may run. It is required whenever Credentials issues expiring
+	// credentials, because a pool on such a credential is retired this long
+	// before expiry so its outstanding transactions can drain.
+	LongestTransaction time.Duration
+
+	// Clock reads "now" for minted ids, canonicalized timestamps, cache
+	// expiry and retirement. Zero means domain.SystemClock.
 	Clock domain.Clock
+
+	// OnCredentialReleaseError, when non-nil, is called after a best-effort
+	// credential release fails. It may be called concurrently during Close;
+	// the hook must be safe for concurrent use. The resolver has no logger of
+	// its own; wire this to your logger or metric.
+	OnCredentialReleaseError func(domain.PoolRef, error)
 
 	// Opener, when non-nil, replaces how a pool's connection pool is
 	// opened. Zero means the production opener, which hands the pool row's
@@ -107,7 +119,7 @@ type Config struct {
 	// per-pool credential from OpenBao's database secrets engine with a
 	// lease, and whose package doc comment is where the measurements and
 	// the operational requirements are written down. Setting this requires
-	// Cache.LongestTransaction, because a credential that expires forces a
+	// LongestTransaction, because a credential that expires forces a
 	// decision about how long a transaction may run — see Open, which
 	// refuses the configuration rather than discovering it later.
 	//
@@ -155,18 +167,18 @@ func Open(ctx context.Context, cfg Config) (*Tenancy, error) {
 			domain.ErrInvalidConfig, cfg.AppRole)
 	}
 
-	if cfg.Credentials != nil && cfg.Cache.LongestTransaction <= 0 {
-		// Refused here rather than at the first resolution, because this
-		// is a wiring question with a wiring answer: a credential that
-		// expires means a pool has to be retired early enough for the
-		// transactions already running on it to drain, and nothing in this
-		// module can know how long that is. Getting it wrong in the small
-		// direction is not a slow query — it is a transaction that loses
-		// its privileges mid-statement (SQLSTATE 42501) and a COMMIT that
-		// silently becomes a ROLLBACK, which is a write the application
-		// believes succeeded. See internal/pool's poolEntry.retireAt.
+	if cfg.Cache.TTL < 0 || cfg.Cache.NegativeTTL < 0 {
+		return nil, fmt.Errorf("%w: Cache.TTL and Cache.NegativeTTL must not be negative", domain.ErrInvalidConfig)
+	}
+	if cfg.Postgres.MaxConns > 0 && cfg.Postgres.MinConns > cfg.Postgres.MaxConns {
+		return nil, fmt.Errorf("%w: Postgres.MinConns must not exceed Postgres.MaxConns", domain.ErrInvalidConfig)
+	}
+	if cfg.LongestTransaction < 0 {
+		return nil, fmt.Errorf("%w: LongestTransaction must not be negative", domain.ErrInvalidConfig)
+	}
+	if cfg.Credentials != nil && cfg.LongestTransaction <= 0 {
 		return nil, fmt.Errorf(
-			"%w: Cache.LongestTransaction is required when Credentials is set: it is the longest "+
+			"%w: LongestTransaction is required when Credentials is set: it is the longest "+
 				"transaction this deployment serves, and a pool on an expiring credential is retired "+
 				"that long before the credential expires so its outstanding transactions can finish",
 			domain.ErrInvalidConfig)
@@ -191,17 +203,19 @@ func Open(ctx context.Context, cfg Config) (*Tenancy, error) {
 		opener = pool.NewOpener(cfg.Postgres)
 	}
 
-	cache := cfg.Cache
-	if cache.Clock == nil {
-		cache.Clock = clock
-	}
-	if cache.Credentials == nil {
-		cache.Credentials = cfg.Credentials
-	}
+	resolver := pool.NewResolver(control, opener, cfg.Cache, pool.LifecycleOptions{
+		Credentials:              cfg.Credentials,
+		LongestTransaction:       cfg.LongestTransaction,
+		Clock:                    clock,
+		OnCredentialReleaseError: cfg.OnCredentialReleaseError,
+	})
+	control.SetTenantStatusObserver(func(id domain.TenantID, _ domain.TenantStatus) {
+		resolver.InvalidateTenant(id)
+	})
 
 	return &Tenancy{
 		control:  control,
-		resolver: pool.NewResolver(control, opener, cache),
+		resolver: resolver,
 		appRole:  cfg.AppRole,
 	}, nil
 }
@@ -234,8 +248,14 @@ func (t *Tenancy) Scope(ctx context.Context, id domain.TenantID) (pg.Scoped, err
 	if err != nil {
 		return pg.Scoped{}, err
 	}
-	return pg.NewScoped(handle.Tenant, handle.Pool, handle.DB, t.appRole), nil
+	return pg.NewScoped(handle.Tenant, handle.Pool.Ref(), handle.DB, t.appRole), nil
 }
+
+// Stats returns a point-in-time snapshot of resolver state: open pools,
+// retired/closing entries, cache sizes, and credential issue/release counters.
+// It is intended for an operator's metrics endpoint; the module has no metrics
+// dependency of its own.
+func (t *Tenancy) Stats() pool.Stats { return t.resolver.Stats() }
 
 // Close closes every pool the resolver opened and the control plane's own.
 // It is idempotent.
@@ -263,8 +283,20 @@ func (t *Tenancy) Close() error {
 // a glance which containers are safe by construction. See CONVENTIONS.md's
 // "Rendering a secret".
 func (cfg Config) String() string {
-	return fmt.Sprintf("tenancy.Config{RegistryDSN: %s, AppRole: %q, Postgres: %+v, Cache: %+v, Clock: %T, Opener: %s, Credentials: %T}",
-		cfg.RegistryDSN, cfg.AppRole, cfg.Postgres, cfg.Cache, cfg.Clock, openerDescription(cfg.Opener), cfg.Credentials)
+	return fmt.Sprintf("tenancy.Config{RegistryDSN: %s, AppRole: %q, Postgres: %s, Cache: {TTL: %s, NegativeTTL: %s, MaxPools: %d, MaxTenants: %d}, LongestTransaction: %s, Clock: %T, Opener: %s, Credentials: %T, OnCredentialReleaseError: %t}",
+		cfg.RegistryDSN, cfg.AppRole, poolConfigDescription(cfg.Postgres),
+		cfg.Cache.TTL, cfg.Cache.NegativeTTL, cfg.Cache.MaxPools, cfg.Cache.MaxTenants,
+		cfg.LongestTransaction, cfg.Clock, openerDescription(cfg.Opener), cfg.Credentials,
+		cfg.OnCredentialReleaseError != nil)
+}
+
+// poolConfigDescription names the non-secret pool fields and the types of the
+// two extension seams. It deliberately does not reflect a custom Tracer or
+// AfterConnect value: either can hold material a consumer should have redacted.
+func poolConfigDescription(c pg.PoolConfig) string {
+	return fmt.Sprintf("{MaxConns: %d, MinConns: %d, MaxConnLifetime: %s, MaxConnIdleTime: %s, ConnectTimeout: %s, ApplicationName: %q, Tracer: %T, AfterConnect: %t}",
+		c.MaxConns, c.MinConns, c.MaxConnLifetime, c.MaxConnIdleTime, c.ConnectTimeout,
+		c.ApplicationName, c.Tracer, c.AfterConnect != nil)
 }
 
 // Format implements fmt.Formatter, the only interface fmt consults for every
@@ -282,11 +314,17 @@ func (cfg Config) LogValue() slog.Value {
 		slog.String("app_role", cfg.AppRole),
 		slog.String("clock", fmt.Sprintf("%T", cfg.Clock)),
 		slog.String("opener", openerDescription(cfg.Opener)),
+		slog.Duration("cache_ttl", cfg.Cache.TTL),
+		slog.Duration("cache_negative_ttl", cfg.Cache.NegativeTTL),
+		slog.Int("cache_max_pools", cfg.Cache.MaxPools),
+		slog.Int("cache_max_tenants", cfg.Cache.MaxTenants),
+		slog.Duration("longest_transaction", cfg.LongestTransaction),
 		// The type name, not the value: a Credentials implementation holds
 		// the material it authenticates to its issuer with, and %T is the
 		// one rendering that reaches no interface and discloses nothing
 		// (CONVENTIONS.md's "Rendering a secret").
 		slog.String("credentials", fmt.Sprintf("%T", cfg.Credentials)),
+		slog.Bool("on_credential_release_error", cfg.OnCredentialReleaseError != nil),
 	)
 }
 

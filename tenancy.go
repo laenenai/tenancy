@@ -83,7 +83,7 @@
 // drains the transactions already running on it, and is replaced on a fresh
 // credential. That lead time is the longest transaction a deployment serves,
 // it is required rather than defaulted, and a credential too short-lived for
-// it is refused with both numbers named. See CacheOptions.LongestTransaction
+// it is refused with both numbers named. See Config.LongestTransaction
 // and credentials/openbao, whose package doc carries the measurements.
 //
 // # The two-pool model
@@ -139,6 +139,8 @@ type (
 	// Tenancy is the control plane, the resolver, and the conversion from
 	// a resolved tenant to a data-plane handle. See scope.Tenancy.
 	Tenancy = scope.Tenancy
+	// Stats is the resolver snapshot returned by Tenancy.Stats.
+	Stats = pool.Stats
 	// Config is everything a deployment supplies to Open. See
 	// scope.Config, and read AppRole's comment before leaving it empty.
 	Config = scope.Config
@@ -179,11 +181,11 @@ type (
 	// Control is the control-plane handle. See registry.Control for why it
 	// exposes no method that takes SQL.
 	Control = registry.Control
-	// NewPool is the input to Control.CreatePool. See registry.NewPool.
-	NewPool = registry.NewPool
-	// NewTenant is the input to Control.CreateTenant. See
-	// registry.NewTenant.
-	NewTenant = registry.NewTenant
+	// PoolSpec is the input to Control.CreatePool. See registry.PoolSpec.
+	PoolSpec = registry.PoolSpec
+	// TenantSpec is the input to Control.CreateTenant. See
+	// registry.TenantSpec.
+	TenantSpec = registry.TenantSpec
 )
 
 // The data plane: one tenant, with its session context already set.
@@ -229,18 +231,19 @@ type (
 	// immutable security mode and lifecycle status.
 	Tenant = domain.Tenant
 	// Pool is a registry row: where a cohort of tenants' metadata lives,
-	// in which region, with what capacity.
+	// in which region, with what capacity. It carries MetadataDSN and is
+	// only returned on the control plane.
 	Pool = domain.Pool
+	// PoolRef is the credential-free part of a pool row: identity,
+	// placement and capacity. It is what a data-plane handle and a
+	// Credentials implementation may see.
+	PoolRef = domain.PoolRef
 	// SecurityMode names how a tenant's content is encrypted at rest. It
 	// is immutable after the tenant's first write, enforced by the schema.
 	SecurityMode = domain.SecurityMode
 	// TenantStatus names a tenant's lifecycle state, which resolution maps
 	// to three different outcomes.
 	TenantStatus = domain.TenantStatus
-	// Readiness is a stored object's processing lifecycle state. This
-	// module declares the closed set and transitions nothing — see
-	// domain.Readiness for why it is here at all.
-	Readiness = domain.Readiness
 )
 
 // Time, as a convention rather than a dependency: these are declared here
@@ -282,6 +285,10 @@ var (
 	// resolver is closed, or the tenant is suspended. A retry is worth
 	// making, in two of those cases after an operator acts.
 	ErrUnavailable = domain.ErrUnavailable
+	// ErrPermission means the deployment's role lacks a privilege the
+	// operation requires. Retrying will not help; change the role or its
+	// grants.
+	ErrPermission = domain.ErrPermission
 	// ErrConflict means a registry write conflicts with existing state: a
 	// duplicate name, a pool that does not exist, or a refused change to
 	// an immutable column.
@@ -298,26 +305,30 @@ var (
 	ErrMalformedID = domain.ErrMalformedID
 )
 
-// RegistryTablesExemptFromRLS names the registry tables that deliberately
-// carry no policy, each with the reason, and AssertRLSCoverage honours it.
-// See pg.RegistryTablesExemptFromRLS for why the exemption is named rather
-// than implied.
-var RegistryTablesExemptFromRLS = pg.RegistryTablesExemptFromRLS
+// RegistryTablesExemptFromRLS returns a copy of the registry tables that
+// deliberately carry no policy, each with the reason, and AssertRLSCoverage
+// honours it. See pg.RegistryTablesExemptFromRLS for why the exemption is
+// named rather than implied.
+func RegistryTablesExemptFromRLS() map[string]string { return pg.RegistryTablesExemptFromRLS() }
 
 // The row-level-security convention, as constants, because a consumer's
 // own migrations and its own catalog assertions have to name them.
 const (
 	// Schema is the Postgres schema this module owns.
 	Schema = migrate.Schema
+	// Redacted is the fixed placeholder every secret-holding type renders.
+	Redacted = domain.Redacted
 	// MigrationIdentity is the module identity the advisory lock key
 	// derives from. It is exported because it is operational surface, and
 	// it is pinned by a test because it contains a module path.
 	MigrationIdentity = migrate.Identity
 	// TenantGUC is the session variable every policy keys off.
 	TenantGUC = pg.TenantGUC
-	// TenantPolicyName is the fixed name EnableRLS gives every policy it
-	// creates.
+	// TenantPolicyName is the fixed name EnableRLS gives the restrictive
+	// tenant policy.
 	TenantPolicyName = pg.TenantPolicyName
+	// TenantAccessPolicyName is the permissive companion EnableRLS creates.
+	TenantAccessPolicyName = pg.TenantAccessPolicyName
 	// TenantPredicate is the single source of truth for the policy
 	// expression, used as both USING and WITH CHECK. Read its doc comment
 	// before copying it: the absence of a cast is load-bearing.
@@ -330,6 +341,9 @@ const (
 	// DefaultMaxTenants is the bound CacheOptions.MaxTenants takes when it
 	// is zero or negative. It is deliberately not "unbounded".
 	DefaultMaxTenants = pool.DefaultMaxTenants
+	// DefaultMaxPools is the bound CacheOptions.MaxPools takes when it is
+	// zero. A negative value explicitly means unbounded.
+	DefaultMaxPools = pool.DefaultMaxPools
 )
 
 // The security modes. Immutable after a tenant's first write.
@@ -345,14 +359,6 @@ const (
 	TenantStatusActive    = domain.TenantStatusActive
 	TenantStatusSuspended = domain.TenantStatusSuspended
 	TenantStatusDeleting  = domain.TenantStatusDeleting
-)
-
-// The readiness states.
-const (
-	ReadinessPending     = domain.ReadinessPending
-	ReadinessReady       = domain.ReadinessReady
-	ReadinessQuarantined = domain.ReadinessQuarantined
-	ReadinessErased      = domain.ReadinessErased
 )
 
 // Open connects the control plane and builds the resolver. See
@@ -405,20 +411,34 @@ func AssertRLSCoverage(ctx context.Context, db DDL, schema string) ([]string, er
 // own five lines of pgx setup instead. See pool.NewOpener.
 func NewOpener(cfg PoolConfig) Opener { return pool.NewOpener(cfg) }
 
-// IsRLSViolation reports whether err is Postgres refusing a statement
-// under a policy's WITH CHECK, rather than under any other mechanism. See
-// pg.IsRLSViolation.
-func IsRLSViolation(err error) bool { return pg.IsRLSViolation(err) }
+// IsInsufficientPrivilege reports whether err is Postgres refusing a
+// statement for lack of privilege. SQLSTATE 42501 covers both a missing
+// grant and an RLS policy refusal. See pg.IsInsufficientPrivilege.
+func IsInsufficientPrivilege(err error) bool { return pg.IsInsufficientPrivilege(err) }
 
-// NewTenantID returns a fresh TenantID minted from clock.
+// IsRLSPolicyViolation reports whether err is specifically an RLS policy
+// refusal, not a missing grant or another 42501. See pg.IsRLSPolicyViolation.
+func IsRLSPolicyViolation(err error) bool { return pg.IsRLSPolicyViolation(err) }
+
+// NewTenantID returns a fresh TenantID minted from clock. It panics only if
+// the process cannot read crypto/rand; NewTenantIDErr is the error-returning
+// form for a boundary that can report the failure.
 func NewTenantID(clock Clock) TenantID { return domain.NewTenantID(clock) }
+
+// NewTenantIDErr is the error-returning form of NewTenantID.
+func NewTenantIDErr(clock Clock) (TenantID, error) { return domain.NewTenantIDErr(clock) }
 
 // ParseTenantID parses s as a TenantID, rejecting malformed input with
 // ErrMalformedID. See that sentinel for when it may be surfaced.
 func ParseTenantID(s string) (TenantID, error) { return domain.ParseTenantID(s) }
 
-// NewPoolID returns a fresh PoolID minted from clock.
+// NewPoolID returns a fresh PoolID minted from clock. It panics only if the
+// process cannot read crypto/rand; NewPoolIDErr is the error-returning form
+// for a boundary that can report the failure.
 func NewPoolID(clock Clock) PoolID { return domain.NewPoolID(clock) }
+
+// NewPoolIDErr is the error-returning form of NewPoolID.
+func NewPoolIDErr(clock Clock) (PoolID, error) { return domain.NewPoolIDErr(clock) }
 
 // ParsePoolID parses s as a PoolID, rejecting malformed input.
 func ParsePoolID(s string) (PoolID, error) { return domain.ParsePoolID(s) }

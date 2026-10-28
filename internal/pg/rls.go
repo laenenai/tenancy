@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -92,7 +93,7 @@ type DDL interface {
 // exactly like an oversight to the next person who reads the schema and
 // "fixes" the apparent gap. Naming them keeps the reasoning at the place
 // where that mistake would be made.
-var RegistryTablesExemptFromRLS = map[string]string{
+var registryTablesExemptFromRLS = map[string]string{
 	"tenancy.pools": "resolution reads tenancy.pools and tenancy.tenants before any tenant " +
 		"session context exists — a policy keyed on " + TenantGUC + " would stop the resolver " +
 		"reading the very row that establishes that context; see db/migrations/00001_registry.sql",
@@ -101,10 +102,22 @@ var RegistryTablesExemptFromRLS = map[string]string{
 		"reading the very row that establishes that context; see db/migrations/00001_registry.sql",
 }
 
+// RegistryTablesExemptFromRLS returns a copy of the named exemptions. It is a
+// function rather than an exported map so a consumer cannot silently weaken
+// the coverage check by mutating the allow-list.
+func RegistryTablesExemptFromRLS() map[string]string {
+	out := make(map[string]string, len(registryTablesExemptFromRLS))
+	for table, reason := range registryTablesExemptFromRLS {
+		out[table] = reason
+	}
+	return out
+}
+
 // EnableRLS enables and FORCEs row-level security on each table in tables
-// (each given as "schema.table") and creates the single policy enforcing
-// this system's tenant isolation convention: TenantPredicate as both USING
-// and WITH CHECK.
+// (each given as "schema.table") and creates the two policies enforcing this
+// system's tenant isolation convention: a restrictive tenant_isolation policy
+// and a permissive tenant_access companion, both using TenantPredicate as
+// USING and WITH CHECK.
 //
 // Each table must already have a tenant_id column; EnableRLS does not
 // create one, and CREATE POLICY is what fails if it is missing.
@@ -212,7 +225,7 @@ func enableOne(ctx context.Context, db DDL, table, ident string) error {
 			// and server internals. table is the caller's own argument and
 			// is safe to echo. See
 			// TestEnableRLS_ErrorsNeverForwardRawPostgresText.
-			return fmt.Errorf("%w: enable row-level security on %s", domain.ErrUnavailable, table)
+			return fmt.Errorf("%w: enable row-level security on %s", classifyDDLError(err), table)
 		}
 	}
 
@@ -273,19 +286,49 @@ func AssertRLSCoverage(ctx context.Context, db DDL, schema string) ([]string, er
 	var uncovered []string
 	for _, table := range candidates {
 		qualified := schema + "." + table
-		if _, exempt := RegistryTablesExemptFromRLS[qualified]; exempt {
+		if _, exempt := registryTablesExemptFromRLS[qualified]; exempt {
 			continue
 		}
 
-		var policyCount int
-		err := db.QueryRow(ctx,
-			"SELECT count(*) FROM pg_policies WHERE schemaname = $1 AND tablename = $2",
-			schema, table,
-		).Scan(&policyCount)
+		var enabled, forced, tenantPolicy, tenantCheck, tenantPredicate, companion bool
+		err := db.QueryRow(ctx, `
+			SELECT c.relrowsecurity,
+			       c.relforcerowsecurity,
+			       EXISTS (
+			           SELECT 1 FROM pg_policy p
+			           WHERE p.polrelid = c.oid AND p.polname = $3 AND NOT p.polpermissive
+			       ),
+			       EXISTS (
+			           SELECT 1 FROM pg_policy p
+			           WHERE p.polrelid = c.oid AND p.polname = $3 AND NOT p.polpermissive
+			             AND p.polwithcheck IS NOT NULL
+			       ),
+			       EXISTS (
+			           SELECT 1 FROM pg_policy p
+			           WHERE p.polrelid = c.oid AND p.polname = $3 AND NOT p.polpermissive
+			             AND lower(coalesce(pg_get_expr(p.polqual, c.oid), '')) LIKE '%tenant_id%'
+			             AND lower(coalesce(pg_get_expr(p.polqual, c.oid), '')) LIKE '%nullif%'
+			             AND lower(coalesce(pg_get_expr(p.polqual, c.oid), '')) LIKE '%current_setting%'
+			             AND lower(coalesce(pg_get_expr(p.polqual, c.oid), '')) LIKE '%' || lower($4) || '%'
+			       ),
+			       EXISTS (
+			           SELECT 1 FROM pg_policy p
+			           WHERE p.polrelid = c.oid AND p.polpermissive
+			       )
+			FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r', 'p')
+		`, schema, table, TenantPolicyName, TenantGUC).Scan(
+			&enabled, &forced, &tenantPolicy, &tenantCheck, &tenantPredicate, &companion,
+		)
 		if err != nil {
-			return nil, fmt.Errorf("%w: counting policies on %s", domain.ErrUnavailable, qualified)
+			if errors.Is(err, pgx.ErrNoRows) {
+				uncovered = append(uncovered, qualified)
+				continue
+			}
+			return nil, fmt.Errorf("%w: reading the row-security state of %s", domain.ErrUnavailable, qualified)
 		}
-		if policyCount == 0 {
+		if !enabled || !forced || !tenantPolicy || !tenantCheck || !tenantPredicate || !companion {
 			uncovered = append(uncovered, qualified)
 		}
 	}
@@ -295,6 +338,21 @@ func AssertRLSCoverage(ctx context.Context, db DDL, schema string) ([]string, er
 // qualifiedIdentifier parses table as "schema.table" and returns it
 // rendered as a safely quoted SQL identifier, never raw-interpolated, or
 // domain.ErrInvalidConfig if table is not in that exact two-part shape.
+// classifyDDLError separates a missing table/column (a permanent schema
+// mistake) and a privilege failure from a transient database problem.
+func classifyDDLError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "42P01", "42703", "3F000": // undefined_table, undefined_column, invalid_schema
+			return domain.ErrInvalidConfig
+		case "42501":
+			return domain.ErrPermission
+		}
+	}
+	return domain.ErrUnavailable
+}
+
 func qualifiedIdentifier(table string) (string, error) {
 	schema, name, ok := strings.Cut(table, ".")
 	if !ok || schema == "" || name == "" || strings.Contains(name, ".") {

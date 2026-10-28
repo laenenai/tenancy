@@ -99,22 +99,25 @@ type Deployment struct {
 	RuntimeDSN tenancy.DSN
 
 	// AppRole is the role every data-plane transaction narrows itself into
-	// with SET LOCAL ROLE, and the role the registry's grants are asserted
-	// against.
+	// with SET LOCAL ROLE. It deliberately receives no registry privileges.
 	//
 	// Required, even when RuntimeDSN already names a non-superuser role:
-	// the suite asserts the privileges this role holds, and a deployment
-	// with no named application role has no privilege separation to
-	// assert.
+	// the suite asserts that the data-plane role cannot read the registry.
 	AppRole string
+
+	// ControlRole is the grantee that receives the registry's privileges.
+	// The control-plane login role is a member of it.
+	//
+	// Required.
+	ControlRole string
 }
 
 // String names the deployment's application role and redacts both
 // credentials. A Deployment is what a harness builds and what a failing
 // factory is most likely to print. See CONVENTIONS.md's "Rendering a secret".
 func (d Deployment) String() string {
-	return fmt.Sprintf("tenancytest.Deployment{MigrationDSN: %s, RuntimeDSN: %s, AppRole: %q}",
-		d.MigrationDSN, d.RuntimeDSN, d.AppRole)
+	return fmt.Sprintf("tenancytest.Deployment{MigrationDSN: %s, RuntimeDSN: %s, AppRole: %q, ControlRole: %q}",
+		d.MigrationDSN, d.RuntimeDSN, d.AppRole, d.ControlRole)
 }
 
 // Format implements fmt.Formatter, the only interface fmt consults for every
@@ -160,7 +163,8 @@ func RunTenancySuite(t *testing.T, newDeployment func(t *testing.T) Deployment) 
 	t.Run("UnknownAndDeletingTenantsAreIndistinguishable", testUnknownAndDeletingAreIndistinguishable(newDeployment))
 	t.Run("SuspendedTenantIsRefusedAndNeverCached", testSuspendedTenantIsRefusedAndNeverCached(newDeployment))
 	t.Run("SecurityModeIsImmutableInTheSchema", testSecurityModeIsImmutable(newDeployment))
-	t.Run("AppRoleHoldsExactlyTheRegistryPrivileges", testAppRolePrivileges(newDeployment))
+	t.Run("RoleSplitHoldsOnEveryRun", testAppRolePrivileges(newDeployment))
+	t.Run("WorkerCapacityFitsTheColumn", testWorkerCapacityFitsTheColumn(newDeployment))
 	t.Run("RenderingsOfAResolvedScope", testRenderingsOfAResolvedScope(newDeployment))
 
 	// Pool and handle lifecycle: the bugs `cas` found, at the level a
@@ -187,11 +191,12 @@ func RunTenancySuite(t *testing.T, newDeployment func(t *testing.T) Deployment) 
 // outside tenancy's own schema so that a coverage sweep of the registry
 // has no opinion about them either way.
 const (
-	fixtureSchema   = "tenancytest_fixture"
-	forcedTable     = fixtureSchema + ".scoped"
-	unforcedTable   = fixtureSchema + ".scoped_unforced"
-	uncoveredTable  = fixtureSchema + ".no_policy"
-	fixtureOwnerRol = "tenancytest_owner"
+	fixtureSchema       = "tenancytest_fixture"
+	forcedTable         = fixtureSchema + ".scoped"
+	unforcedTable       = fixtureSchema + ".scoped_unforced"
+	uncoveredTable      = fixtureSchema + ".no_policy"
+	wrongPredicateTable = fixtureSchema + ".wrong_predicate"
+	fixtureOwnerRol     = "tenancytest_owner"
 )
 
 // env is one wired deployment: the module, the credentials, and the raw
@@ -237,8 +242,9 @@ func setup(t *testing.T, dep Deployment, cache tenancy.CacheOptions, appRole str
 	}
 
 	if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{
-		DSN:     dep.MigrationDSN,
-		AppRole: dep.AppRole,
+		DSN:         dep.MigrationDSN,
+		AppRole:     dep.AppRole,
+		ControlRole: dep.ControlRole,
 	}); err != nil {
 		t.Fatalf("tenancy.Migrate: %v", err)
 	}
@@ -299,6 +305,11 @@ func (e *env) standUpFixtures(ctx context.Context, t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS "+forcedTable+" (id text PRIMARY KEY, tenant_id text NOT NULL, data text NOT NULL DEFAULT '')",
 		"CREATE TABLE IF NOT EXISTS "+unforcedTable+" (id text PRIMARY KEY, tenant_id text NOT NULL, data text NOT NULL DEFAULT '')",
 		"CREATE TABLE IF NOT EXISTS "+uncoveredTable+" (id text PRIMARY KEY, tenant_id text NOT NULL)",
+		"CREATE TABLE IF NOT EXISTS "+wrongPredicateTable+" (id text PRIMARY KEY, tenant_id text NOT NULL)",
+		"ALTER TABLE "+wrongPredicateTable+" ENABLE ROW LEVEL SECURITY",
+		"ALTER TABLE "+wrongPredicateTable+" FORCE ROW LEVEL SECURITY",
+		"CREATE POLICY "+tenancy.TenantPolicyName+" ON "+wrongPredicateTable+" AS RESTRICTIVE USING (true) WITH CHECK (true)",
+		"CREATE POLICY "+tenancy.TenantAccessPolicyName+" ON "+wrongPredicateTable+" AS PERMISSIVE USING (true) WITH CHECK (true)",
 		"ALTER TABLE "+forcedTable+" OWNER TO "+quote(fixtureOwnerRol),
 		"ALTER TABLE "+unforcedTable+" OWNER TO "+quote(fixtureOwnerRol),
 		"GRANT SELECT, INSERT, UPDATE, DELETE ON "+forcedTable+" TO "+quote(e.dep.AppRole),
@@ -461,13 +472,19 @@ func testSuspendedTenantIsRefusedAndNeverCached(newDeployment func(t *testing.T)
 		ctx := context.Background()
 		control := e.tenancy.Control()
 
+		// Warm the positive cache first: the status change must invalidate
+		// it, not wait for TTL.
+		if _, err := e.tenancy.Scope(ctx, e.tenantA.ID); err != nil {
+			t.Fatalf("Scope(active): %v", err)
+		}
+
 		if _, err := control.SetTenantStatus(ctx, e.tenantA.ID, tenancy.TenantStatusSuspended); err != nil {
 			t.Fatalf("SetTenantStatus(suspended): %v", err)
 		}
 
 		_, err := e.tenancy.Scope(ctx, e.tenantA.ID)
 		if !errors.Is(err, tenancy.ErrUnavailable) {
-			t.Fatalf("Scope(suspended) error = %v, want ErrUnavailable", err)
+			t.Fatalf("Scope(suspended after a warm cache) error = %v, want ErrUnavailable", err)
 		}
 		if errors.Is(err, tenancy.ErrNotAuthorizedOrNotFound) {
 			t.Fatalf("Scope(suspended) error = %v, must not also be ErrNotAuthorizedOrNotFound: "+
@@ -480,6 +497,23 @@ func testSuspendedTenantIsRefusedAndNeverCached(newDeployment func(t *testing.T)
 		if _, err := e.tenancy.Scope(ctx, e.tenantA.ID); err != nil {
 			t.Fatalf("Scope() immediately after restoring the tenant = %v, want nil: "+
 				"unsuspending is an operator action and must take effect on the next resolution, not after a TTL", err)
+		}
+
+		// Deletion invalidates a warm entry too, and must be
+		// indistinguishable from unknown.
+		if _, err := control.SetTenantStatus(ctx, e.tenantA.ID, tenancy.TenantStatusDeleting); err != nil {
+			t.Fatalf("SetTenantStatus(deleting): %v", err)
+		}
+		if _, err := e.tenancy.Scope(ctx, e.tenantA.ID); !errors.Is(err, tenancy.ErrNotAuthorizedOrNotFound) {
+			t.Fatalf("Scope(deleting after a warm cache) error = %v, want ErrNotAuthorizedOrNotFound", err)
+		}
+
+		// deleting is terminal: a tenant whose data is being erased must
+		// not be resurrected by a status update.
+		for _, next := range []tenancy.TenantStatus{tenancy.TenantStatusActive, tenancy.TenantStatusSuspended} {
+			if _, err := control.SetTenantStatus(ctx, e.tenantA.ID, next); !errors.Is(err, tenancy.ErrConflict) {
+				t.Errorf("SetTenantStatus(deleting -> %s) error = %v, want ErrConflict", next, err)
+			}
 		}
 	}
 }
@@ -509,6 +543,19 @@ func testSecurityModeIsImmutable(newDeployment func(t *testing.T) Deployment) fu
 		if _, err := e.tenancy.Control().SetTenantStatus(ctx, e.tenantA.ID, tenancy.TenantStatusSuspended); err != nil {
 			t.Fatalf("SetTenantStatus after the refused security_mode change: %v", err)
 		}
+
+		// A tenant's pool_id decides where its data lives; a pool's
+		// metadata_dsn decides which database it is. Both are immutable
+		// through an ordinary UPDATE so a mistake or an injection cannot
+		// repoint them.
+		if _, err := e.admin.Exec(ctx,
+			"UPDATE tenancy.tenants SET pool_id = $2 WHERE id = $1", string(e.tenantA.ID), string(e.poolB.ID)); err == nil {
+			t.Fatal("pool_id was mutable; a tenant could be repointed without an explicit migration")
+		}
+		if _, err := e.admin.Exec(ctx,
+			"UPDATE tenancy.pools SET metadata_dsn = 'postgres://evil.invalid/db' WHERE id = $1", string(e.poolA.ID)); err == nil {
+			t.Fatal("metadata_dsn was mutable; a pool could be repointed without an explicit migration")
+		}
 	}
 }
 
@@ -521,13 +568,28 @@ func testSecurityModeIsImmutable(newDeployment func(t *testing.T) Deployment) fu
 // design exists to close is silent: a deployment that renamed its role
 // would otherwise come up with no privilege separation at all while the
 // migrator reported everything applied.
+func testWorkerCapacityFitsTheColumn(newDeployment func(t *testing.T) Deployment) func(*testing.T) {
+	return func(t *testing.T) {
+		e := setup(t, newDeployment(t), defaultCache(), "", 0)
+		ctx := context.Background()
+
+		_, err := e.tenancy.Control().CreatePool(ctx, tenancy.PoolSpec{
+			Name: "overflow", Region: "test-region", MetadataDSN: e.poolA.MetadataDSN,
+			BlobConfigRef: "blob-overflow", WorkerCapacity: int(^uint32(0)>>1) + 1,
+		})
+		if !errors.Is(err, tenancy.ErrInvalidConfig) {
+			t.Fatalf("CreatePool with an out-of-range capacity error = %v, want ErrInvalidConfig", err)
+		}
+	}
+}
+
 func testAppRolePrivileges(newDeployment func(t *testing.T) Deployment) func(*testing.T) {
 	return func(t *testing.T) {
 		dep := newDeployment(t)
 		e := setup(t, dep, defaultCache(), dep.AppRole, 0)
 		ctx := context.Background()
 
-		cases := []struct {
+		controlCases := []struct {
 			privilege string
 			want      bool
 		}{
@@ -540,31 +602,65 @@ func testAppRolePrivileges(newDeployment func(t *testing.T) Deployment) func(*te
 			{"TRIGGER", false},
 		}
 		for _, table := range []string{"tenancy.pools", "tenancy.tenants"} {
-			for _, tc := range cases {
+			for _, tc := range controlCases {
 				var has bool
 				err := e.admin.QueryRow(ctx,
-					"SELECT has_table_privilege($1, $2, $3)", dep.AppRole, table, tc.privilege).Scan(&has)
+					"SELECT has_table_privilege($1, $2, $3)", dep.ControlRole, table, tc.privilege).Scan(&has)
 				if err != nil {
-					t.Fatalf("has_table_privilege(%s, %s, %s): %v", dep.AppRole, table, tc.privilege, err)
+					t.Fatalf("has_table_privilege(%s, %s, %s): %v", dep.ControlRole, table, tc.privilege, err)
 				}
 				if has != tc.want {
-					t.Errorf("%s on %s = %v, want %v", tc.privilege, table, has, tc.want)
+					t.Errorf("%s on %s for ControlRole = %v, want %v", tc.privilege, table, has, tc.want)
+				}
+			}
+		}
+
+		// The data-plane role must have no registry privilege at all; that
+		// is the role split, and it is what keeps a tenant-pool injection
+		// away from every pool's DSN.
+		for _, table := range []string{"tenancy.pools", "tenancy.tenants"} {
+			for _, privilege := range []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"} {
+				var has bool
+				if err := e.admin.QueryRow(ctx,
+					"SELECT has_table_privilege($1, $2, $3)", dep.AppRole, table, privilege).Scan(&has); err != nil {
+					t.Fatalf("has_table_privilege(%s, %s, %s): %v", dep.AppRole, table, privilege, err)
+				}
+				if has {
+					t.Errorf("data-plane role %s has %s on %s; the role split requires none", dep.AppRole, privilege, table)
 				}
 			}
 		}
 
 		// Re-running Up must leave the same answer: that is what
 		// "asserted on every run" means.
-		if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{DSN: dep.MigrationDSN, AppRole: dep.AppRole}); err != nil {
+		if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{DSN: dep.MigrationDSN, AppRole: dep.AppRole, ControlRole: dep.ControlRole}); err != nil {
 			t.Fatalf("tenancy.Migrate a second time: %v", err)
 		}
 		var stillHasDelete bool
 		if err := e.admin.QueryRow(ctx,
-			"SELECT has_table_privilege($1, 'tenancy.tenants', 'DELETE')", dep.AppRole).Scan(&stillHasDelete); err != nil {
+			"SELECT has_table_privilege($1, 'tenancy.tenants', 'DELETE')", dep.ControlRole).Scan(&stillHasDelete); err != nil {
 			t.Fatalf("re-read DELETE: %v", err)
 		}
 		if stillHasDelete {
 			t.Error("DELETE on tenancy.tenants appeared after a second Migrate")
+		}
+
+		// Simulate the pre-split grant set, then re-run Up. The reconciler
+		// must revoke the data role's old registry access, not merely grant
+		// the control role.
+		if _, err := e.admin.Exec(ctx, "GRANT SELECT ON tenancy.tenants TO "+quote(dep.AppRole)); err != nil {
+			t.Fatalf("grant the old data-role privilege: %v", err)
+		}
+		if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{DSN: dep.MigrationDSN, AppRole: dep.AppRole, ControlRole: dep.ControlRole}); err != nil {
+			t.Fatalf("tenancy.Migrate after granting the old privilege: %v", err)
+		}
+		var oldGrantSurvived bool
+		if err := e.admin.QueryRow(ctx,
+			"SELECT has_table_privilege($1, 'tenancy.tenants', 'SELECT')", dep.AppRole).Scan(&oldGrantSurvived); err != nil {
+			t.Fatalf("re-read the old data-role privilege: %v", err)
+		}
+		if oldGrantSurvived {
+			t.Error("the data role kept a registry grant after Migrate; the role split is not repaired on upgrade")
 		}
 	}
 }
@@ -1176,6 +1272,10 @@ func testRLSCoverageSweep(newDeployment func(t *testing.T) Deployment) func(*tes
 			t.Errorf("AssertRLSCoverage = %v, want it to report %s: a tenant-scoped table with no policy is "+
 				"exactly what this sweep exists to catch in a consumer's CI", uncovered, uncoveredTable)
 		}
+		if !contains(uncovered, wrongPredicateTable) {
+			t.Errorf("AssertRLSCoverage = %v, want it to report %s: the policy has the right name but a predicate "+
+				"that permits every row", uncovered, wrongPredicateTable)
+		}
 		if contains(uncovered, forcedTable) {
 			t.Errorf("AssertRLSCoverage = %v, want %s covered after EnableRLS", uncovered, forcedTable)
 		}
@@ -1189,7 +1289,7 @@ func testRLSCoverageSweep(newDeployment func(t *testing.T) Deployment) func(*tes
 		if len(registry) != 0 {
 			t.Errorf("AssertRLSCoverage(%s) = %v, want empty", tenancy.Schema, registry)
 		}
-		for table := range tenancy.RegistryTablesExemptFromRLS {
+		for table := range tenancy.RegistryTablesExemptFromRLS() {
 			if contains(registry, table) {
 				t.Errorf("%s is reported uncovered despite being a named exemption", table)
 			}
@@ -1296,7 +1396,7 @@ func assertPolicyRefusal(t *testing.T, err error, what string) {
 	if err == nil {
 		t.Fatalf("%s succeeded; the policy's WITH CHECK is not fail-closed", what)
 	}
-	if !tenancy.IsRLSViolation(err) {
+	if !tenancy.IsRLSPolicyViolation(err) {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) {
 			t.Fatalf("%s was refused with SQLSTATE %s (%s), want %s. A refusal from some other mechanism "+
@@ -1330,7 +1430,7 @@ func mustScope(ctx context.Context, t *testing.T, ten *tenancy.Tenancy, id tenan
 
 func mustCreatePool(ctx context.Context, t *testing.T, control *tenancy.Control, name string, dsn tenancy.DSN) tenancy.Pool {
 	t.Helper()
-	p, err := control.CreatePool(ctx, tenancy.NewPool{
+	p, err := control.CreatePool(ctx, tenancy.PoolSpec{
 		Name:           name,
 		Region:         "test-region",
 		MetadataDSN:    dsn,
@@ -1345,7 +1445,7 @@ func mustCreatePool(ctx context.Context, t *testing.T, control *tenancy.Control,
 
 func mustCreateTenant(ctx context.Context, t *testing.T, control *tenancy.Control, poolID tenancy.PoolID, name string) tenancy.Tenant {
 	t.Helper()
-	tn, err := control.CreateTenant(ctx, tenancy.NewTenant{
+	tn, err := control.CreateTenant(ctx, tenancy.TenantSpec{
 		PoolID:       poolID,
 		Name:         name,
 		SecurityMode: tenancy.SecurityModeManaged,

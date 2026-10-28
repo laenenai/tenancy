@@ -54,15 +54,16 @@ type PoolID string
 // lexicographically by creation time because a ULID's 48-bit millisecond
 // timestamp occupies its leading, fixed-width characters.
 //
-// ulid.MustNew panics if entropy fails to supply enough random bytes. That
-// is inherited deliberately from `cas`, not overlooked: a crypto/rand read
-// failure here means this process has lost its entropy source, so its
-// identifiers and its encryption are both already broken, and there is
-// nothing a returned error at this call site could do better than failing
-// loudly.
-func newID[T ~string](clock Clock) T {
-	id := ulid.MustNew(ulid.Timestamp(clock.Now()), rand.Reader)
-	return T(id.String())
+// The error-returning form is used at the registry boundary. The convenience
+// New...ID functions keep the historical panic for test fixtures and callers
+// that have no error path; crypto/rand failure is fatal in either case, but a
+// library should not force the panic on a caller that can report it.
+func newID[T ~string](clock Clock) (T, error) {
+	id, err := ulid.New(ulid.Timestamp(clock.Now()), rand.Reader)
+	if err != nil {
+		return T(""), fmt.Errorf("%w: mint an id: %w", ErrUnavailable, err)
+	}
+	return T(id.String()), nil
 }
 
 // parseID validates that s is a syntactically well-formed ULID string and
@@ -74,14 +75,36 @@ func parseID[T ~string](label, s string) (T, error) {
 	return T(s), nil
 }
 
-// NewTenantID returns a fresh TenantID minted from clock.
-func NewTenantID(clock Clock) TenantID { return newID[TenantID](clock) }
+// NewTenantID returns a fresh TenantID minted from clock. It panics if the
+// process cannot read entropy; use NewTenantIDErr at a boundary that can
+// return the failure.
+func NewTenantID(clock Clock) TenantID {
+	id, err := newID[TenantID](clock)
+	if err != nil {
+		panic(err) //nolint:forbidigo // documented Must-style convenience; New...Err is the boundary API
+	}
+	return id
+}
+
+// NewTenantIDErr is the error-returning form of NewTenantID.
+func NewTenantIDErr(clock Clock) (TenantID, error) { return newID[TenantID](clock) }
 
 // ParseTenantID parses s as a TenantID, rejecting malformed input.
 func ParseTenantID(s string) (TenantID, error) { return parseID[TenantID]("tenant id", s) }
 
-// NewPoolID returns a fresh PoolID minted from clock.
-func NewPoolID(clock Clock) PoolID { return newID[PoolID](clock) }
+// NewPoolID returns a fresh PoolID minted from clock. It panics if the
+// process cannot read entropy; use NewPoolIDErr at a boundary that can return
+// the failure.
+func NewPoolID(clock Clock) PoolID {
+	id, err := newID[PoolID](clock)
+	if err != nil {
+		panic(err) //nolint:forbidigo // documented Must-style convenience; New...Err is the boundary API
+	}
+	return id
+}
+
+// NewPoolIDErr is the error-returning form of NewPoolID.
+func NewPoolIDErr(clock Clock) (PoolID, error) { return newID[PoolID](clock) }
 
 // ParsePoolID parses s as a PoolID, rejecting malformed input.
 func ParsePoolID(s string) (PoolID, error) { return parseID[PoolID]("pool id", s) }

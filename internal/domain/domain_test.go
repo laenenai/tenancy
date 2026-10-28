@@ -2,6 +2,7 @@ package domain_test
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +86,7 @@ func TestSentinelsAreIndependent(t *testing.T) {
 		"ErrInvalidConfig":           domain.ErrInvalidConfig,
 		"ErrNotAuthorizedOrNotFound": domain.ErrNotAuthorizedOrNotFound,
 		"ErrUnavailable":             domain.ErrUnavailable,
+		"ErrPermission":              domain.ErrPermission,
 		"ErrConflict":                domain.ErrConflict,
 		"ErrNoTenantScope":           domain.ErrNoTenantScope,
 		"ErrMalformedID":             domain.ErrMalformedID,
@@ -136,21 +138,73 @@ func TestTenantStatusValid(t *testing.T) {
 	}
 }
 
-func TestReadinessValid(t *testing.T) {
+func TestTenantStatusTransitions(t *testing.T) {
 	t.Parallel()
 
-	for _, r := range []domain.Readiness{
-		domain.ReadinessPending, domain.ReadinessReady,
-		domain.ReadinessQuarantined, domain.ReadinessErased,
-	} {
-		if !r.Valid() {
-			t.Errorf("Readiness(%q).Valid() = false, want true", r)
+	cases := []struct {
+		from, to domain.TenantStatus
+		want     bool
+	}{
+		{domain.TenantStatusActive, domain.TenantStatusActive, true},
+		{domain.TenantStatusActive, domain.TenantStatusSuspended, true},
+		{domain.TenantStatusActive, domain.TenantStatusDeleting, true},
+		{domain.TenantStatusSuspended, domain.TenantStatusActive, true},
+		{domain.TenantStatusSuspended, domain.TenantStatusSuspended, true},
+		{domain.TenantStatusSuspended, domain.TenantStatusDeleting, true},
+		{domain.TenantStatusDeleting, domain.TenantStatusDeleting, true},
+		{domain.TenantStatusDeleting, domain.TenantStatusActive, false},
+		{domain.TenantStatusDeleting, domain.TenantStatusSuspended, false},
+		{"", domain.TenantStatusActive, false},
+		{domain.TenantStatusActive, "", false},
+	}
+	for _, tc := range cases {
+		if got := tc.from.CanTransitionTo(tc.to); got != tc.want {
+			t.Errorf("%q.CanTransitionTo(%q) = %v, want %v", tc.from, tc.to, got, tc.want)
 		}
 	}
-	for _, r := range []domain.Readiness{"", "Ready", "deleted"} {
-		if r.Valid() {
-			t.Errorf("Readiness(%q).Valid() = true, want false", r)
+}
+
+func TestPoolRefDoesNotCarryCredentialMaterial(t *testing.T) {
+	t.Parallel()
+
+	typ := reflect.TypeOf(domain.PoolRef{})
+	for i := range typ.NumField() {
+		if name := typ.Field(i).Name; strings.Contains(strings.ToLower(name), "dsn") {
+			t.Errorf("PoolRef has a %s field; it must not carry connection material", name)
 		}
+	}
+
+	created := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	pool := domain.Pool{ //nolint:gosec // test fixture, not a credential
+		ID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", Name: "pool-a", Region: "eu-west-1",
+		MetadataDSN:   "postgres://user:password@db.invalid/db",
+		BlobConfigRef: "blob-a", WorkerCapacity: 4, CreatedAt: created,
+	}
+	ref := pool.Ref()
+	if ref.ID != pool.ID || ref.Name != pool.Name || ref.Region != pool.Region ||
+		ref.BlobConfigRef != pool.BlobConfigRef || ref.WorkerCapacity != pool.WorkerCapacity ||
+		!ref.CreatedAt.Equal(pool.CreatedAt) {
+		t.Fatalf("Pool.Ref() = %+v, want the non-credential fields of %+v", ref, pool)
+	}
+}
+
+func TestCredentialMarshalTextIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	cred := domain.Credential{
+		Username: "v-token-app-role-1",
+		Password: "CANARY-PASSWORD",
+		LeaseID:  "database/creds/app/lease",
+	}
+	b, err := cred.MarshalText()
+	if err != nil {
+		t.Fatalf("MarshalText: %v", err)
+	}
+	if strings.Contains(string(b), cred.Password) || strings.Contains(string(b), cred.LeaseID) {
+		t.Fatalf("MarshalText leaked credential material: %s", b)
+	}
+	if !strings.Contains(string(b), "tenancy.Credential") {
+		t.Fatalf("MarshalText = %q, want it to name the type", b)
 	}
 }
 
@@ -193,4 +247,28 @@ func TestFixedClockAdvances(t *testing.T) {
 	if want := start.Add(90 * time.Minute); !clock.Now().Equal(want) {
 		t.Fatalf("Now() after Advance = %v, want %v", clock.Now(), want)
 	}
+}
+
+func FuzzParseTenantID(f *testing.F) {
+	for _, seed := range []string{"", "not-a-ulid", "01ARZ3NDEKTSV4RRFFQ69G5FAV"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		id, err := domain.ParseTenantID(s)
+		if err == nil && string(id) != s {
+			t.Fatalf("ParseTenantID(%q) returned %q; a successful parse must be lossless", s, id)
+		}
+	})
+}
+
+func FuzzParsePoolID(f *testing.F) {
+	for _, seed := range []string{"", "not-a-ulid", "01ARZ3NDEKTSV4RRFFQ69G5FAV"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		id, err := domain.ParsePoolID(s)
+		if err == nil && string(id) != s {
+			t.Fatalf("ParsePoolID(%q) returned %q; a successful parse must be lossless", s, id)
+		}
+	})
 }

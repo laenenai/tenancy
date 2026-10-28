@@ -1,7 +1,8 @@
 // Package testdb is the shared container harness for every
 // database-backed test in this set of modules: Start gives a test its own
-// uniquely named, isolated Postgres database, migrated fresh, so tests run
-// in parallel with no shared state and nothing to truncate between them.
+// uniquely named, isolated Postgres database, so tests run in parallel with
+// no shared state and nothing to truncate between them. The database is
+// empty by default; pass WithMigrator to apply a schema.
 //
 // # Why it lives here, and why it is exported
 //
@@ -9,8 +10,9 @@
 // and CONVENTIONS.md settles that the shared one belongs in `tenancy`:
 // tenant scoping and row-level security are what the harness exists to
 // test, and a second consumer now needs it. So this is a public package
-// rather than an internal one, and its API is public surface listed in
-// api.txt — a change here breaks other modules' test suites.
+// rather than an internal one, and its API is the public surface of the
+// testdb module — a change here breaks other modules' test suites and is
+// reported by apidiff/gorelease when the module is released.
 //
 // `cas/internal/testdb` and `audit/internal/testdb` keep their copies
 // until the post-alpha swap. That is the agreed staged migration, not
@@ -25,9 +27,10 @@
 //     it matters. This module has no vector columns of its own; matching
 //     the image is about every module's tests running on the same Postgres
 //     as the deployment.
-//   - Each test gets its own database, created and migrated fresh. Not one
-//     shared database with truncation between tests: there is nothing
-//     shared to reset, which is what lets tests use t.Parallel freely.
+//   - Each test gets its own database, created fresh. It is empty by
+//     default; WithMigrator applies the consumer's schema. Not one shared
+//     database with truncation between tests: there is nothing shared to
+//     reset, which is what lets tests use t.Parallel freely.
 //   - TEST_DATABASE_URL, when set, is used instead of starting a
 //     container — and a unique database is still created on it rather than
 //     reusing a shared one.
@@ -73,18 +76,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"github.com/laenenai/tenancy/internal/domain"
+	"github.com/laenenai/tenancy"
 )
 
 // PostgresImage is the container image Start uses when TEST_DATABASE_URL
 // is not set. See the package doc comment for why it is not stock
 // postgres.
-const PostgresImage = "pgvector/pgvector:pg18"
+const PostgresImage = "pgvector/pgvector:pg18@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb304120ce531a3bf51c0ed7e2bc11"
 
-// AppRole is the application role name this harness's default migrator
-// creates and grants the registry to, and the role a test narrows into
-// with SET LOCAL ROLE before asserting anything about privileges or row
-// security.
+// AppRole is the data-plane role a test narrows into with SET LOCAL ROLE
+// before asserting anything about privileges or row security. The harness
+// does not create or grant it; the consumer's migrator does. It deliberately
+// receives no registry privileges.
 //
 // It is a fixed, test-only name rather than a per-test one because roles
 // are cluster-wide while one container serves the whole run: a role per
@@ -92,6 +95,12 @@ const PostgresImage = "pgvector/pgvector:pg18"
 // server, and there is nothing a test can learn from a unique role name
 // that it cannot learn from a unique database.
 const AppRole = "tenancy_app_test"
+
+// ControlRole is the NOLOGIN grantee that receives the registry privileges.
+// The test database connects as a superuser, so this is mostly a fixture for
+// asserting the role split; it is intentionally separate from AppRole. The
+// consumer's migrator creates it.
+const ControlRole = "tenancy_control_test"
 
 // adminConnectTimeout bounds every administrative connection Start makes:
 // to create or drop a database, and to open the per-test pool.
@@ -107,12 +116,12 @@ const adminConnectTimeout = 10 * time.Second
 // defeat the point. `cas` and `audit`'s harnesses both passed a pool,
 // which is the one place this harness deliberately differs from the copies
 // it replaces.
-type Migrator func(ctx context.Context, dsn domain.DSN) error
+type Migrator func(ctx context.Context, dsn tenancy.DSN) error
 
 // NoMigrations is a Migrator that leaves the database untouched. It is how
 // a test gets a database that exists but is not yet migrated, which is the
 // only way to test migrating.
-func NoMigrations(context.Context, domain.DSN) error { return nil }
+func NoMigrations(context.Context, tenancy.DSN) error { return nil }
 
 // Option configures Start.
 type Option func(*options)
@@ -130,7 +139,7 @@ func WithMigrator(m Migrator) Option {
 // DB is an isolated database created for a single test by Start.
 type DB struct {
 	pool *pgxpool.Pool
-	dsn  domain.DSN
+	dsn  tenancy.DSN
 	name string
 }
 
@@ -152,7 +161,7 @@ func (d *DB) Pool() *pgxpool.Pool { return d.pool }
 //
 // It is what a test passes to tenancy.Migrate as the migration
 // credential, and what it registers as a pool's metadata DSN.
-func (d *DB) DSN() domain.DSN { return d.dsn }
+func (d *DB) DSN() tenancy.DSN { return d.dsn }
 
 // Name returns this test database's name.
 func (d *DB) Name() string { return d.name }
@@ -166,7 +175,7 @@ func (d *DB) Name() string { return d.name }
 // included. Before these four methods, %+v on a *DB printed the container's
 // superuser credential. See CONVENTIONS.md's "Rendering a secret".
 func (d *DB) String() string {
-	return fmt.Sprintf("testdb.DB{name: %q, dsn: %s}", d.name, domain.Redacted)
+	return fmt.Sprintf("testdb.DB{name: %q, dsn: %s}", d.name, tenancy.Redacted)
 }
 
 // Format implements fmt.Formatter, the only interface fmt consults for every
@@ -180,7 +189,7 @@ func (d *DB) MarshalJSON() ([]byte, error) { return json.Marshal(d.String()) }
 func (d *DB) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("name", d.name),
-		slog.String("dsn", domain.Redacted),
+		slog.String("dsn", tenancy.Redacted),
 	)
 }
 
@@ -242,7 +251,14 @@ func Start(t *testing.T, opts ...Option) *DB {
 	var pool *pgxpool.Pool
 	t.Cleanup(func() {
 		if pool != nil {
-			closePoolBounded(t, pool)
+			closed := closePoolBounded(t, pool)
+			dropDatabase(t, serverDSN, dbName)
+			select {
+			case <-closed:
+			case <-time.After(poolCloseTimeout):
+				t.Logf("testdb: cleanup: the pool still did not close after the database was dropped with FORCE")
+			}
+			return
 		}
 		dropDatabase(t, serverDSN, dbName)
 	})
@@ -252,22 +268,22 @@ func Start(t *testing.T, opts ...Option) *DB {
 		t.Fatalf("testdb: build a dsn for database %s: %v", dbName, err)
 	}
 
-	if err := cfg.migrator(ctx, domain.DSN(rawTestDSN)); err != nil {
+	if err := cfg.migrator(ctx, tenancy.DSN(rawTestDSN)); err != nil {
 		t.Fatalf("testdb: run the migrator against database %s: %v", dbName, err)
 	}
 
-	pool, err = openPool(ctx, domain.DSN(rawTestDSN))
+	pool, err = openPool(ctx, tenancy.DSN(rawTestDSN))
 	if err != nil {
 		t.Fatalf("testdb: open a pool for database %s: %v", dbName, err)
 	}
 
-	return &DB{pool: pool, dsn: domain.DSN(rawTestDSN), name: dbName}
+	return &DB{pool: pool, dsn: tenancy.DSN(rawTestDSN), name: dbName}
 }
 
 // openPool opens a pool against dsn and verifies it with one ping, so a
 // failure to connect is reported where it happened rather than inside the
 // first test assertion.
-func openPool(ctx context.Context, dsn domain.DSN) (*pgxpool.Pool, error) {
+func openPool(ctx context.Context, dsn tenancy.DSN) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(string(dsn))
 	if err != nil {
 		// The DSN is not forwarded: pgx's parse error can carry an
@@ -316,7 +332,7 @@ const poolCloseTimeout = 10 * time.Second
 // and the author should see it named. Dropping the database afterwards is safe
 // regardless: dropDatabase uses WITH (FORCE), which terminates whatever is
 // still attached.
-func closePoolBounded(t *testing.T, pool *pgxpool.Pool) {
+func closePoolBounded(t *testing.T, pool *pgxpool.Pool) <-chan struct{} {
 	t.Helper()
 
 	closed := make(chan struct{})
@@ -330,8 +346,9 @@ func closePoolBounded(t *testing.T, pool *pgxpool.Pool) {
 	case <-time.After(poolCloseTimeout):
 		t.Logf("testdb: cleanup: the pool did not close within %s, so a connection is still "+
 			"checked out — most likely a transaction left open by a subtest that failed while "+
-			"holding one. Dropping the database with FORCE anyway.", poolCloseTimeout)
+			"holding one. Dropping the database with FORCE to release it.", poolCloseTimeout)
 	}
+	return closed
 }
 
 func dropDatabase(t *testing.T, serverDSN, name string) {
@@ -400,7 +417,7 @@ func startContainer(ctx context.Context) (string, error) {
 // plus 80 bits of randomness, lowercased because Postgres folds unquoted
 // identifiers to lowercase and this harness has no reason to fight that.
 func newDatabaseName() string {
-	return "tenancytestdb_" + strings.ToLower(string(domain.NewPoolID(domain.SystemClock{})))
+	return "tenancytestdb_" + strings.ToLower(string(tenancy.NewPoolID(tenancy.SystemClock{})))
 }
 
 // withDatabaseName returns dsn with its path replaced by name, so the

@@ -62,7 +62,7 @@ const TenantGUC = "app.tenant_id"
 // rather than a nil-pointer panic, so a caller can assert on it.
 type Scoped struct {
 	tenant  domain.Tenant
-	poolRow domain.Pool
+	poolRef domain.PoolRef
 	db      *pgxpool.Pool
 	appRole string
 }
@@ -74,15 +74,17 @@ type Scoped struct {
 // construction.
 //
 // appRole may be empty, meaning "do not switch roles" — see Tx.
-func NewScoped(tenant domain.Tenant, poolRow domain.Pool, db *pgxpool.Pool, appRole string) Scoped {
-	return Scoped{tenant: tenant, poolRow: poolRow, db: db, appRole: appRole}
+func NewScoped(tenant domain.Tenant, poolRef domain.PoolRef, db *pgxpool.Pool, appRole string) Scoped {
+	return Scoped{tenant: tenant, poolRef: poolRef, db: db, appRole: appRole}
 }
 
 // Tenant returns the tenant this handle is scoped to.
 func (s Scoped) Tenant() domain.Tenant { return s.tenant }
 
-// Pool returns the pool hosting this handle's tenant.
-func (s Scoped) Pool() domain.Pool { return s.poolRow }
+// Pool returns the credential-free reference to the pool hosting this
+// handle's tenant. It deliberately cannot return MetadataDSN: a data-plane
+// caller must not be able to open an unscoped connection that bypasses Tx.
+func (s Scoped) Pool() domain.PoolRef { return s.poolRef }
 
 // AppRole returns the role every transaction this handle opens narrows
 // itself to, or the empty string if it narrows to nothing.
@@ -180,15 +182,25 @@ func (s Scoped) begin(ctx context.Context) (pgx.Tx, error) {
 func (s Scoped) scope(ctx context.Context, tx pgx.Tx) error {
 	if s.appRole != "" {
 		if _, err := tx.Exec(ctx, "SET LOCAL ROLE "+pgx.Identifier{s.appRole}.Sanitize()); err != nil {
-			return fmt.Errorf("%w: narrow the transaction to the application role: %w", domain.ErrUnavailable, err)
+			return fmt.Errorf("%w: narrow the transaction to the application role: %w", mapPGError(err), err)
 		}
 	}
 	if _, err := tx.Exec(ctx,
 		"SELECT set_config($1, $2, true)", TenantGUC, string(s.tenant.ID),
 	); err != nil {
-		return fmt.Errorf("%w: set the tenant session context: %w", domain.ErrUnavailable, err)
+		return fmt.Errorf("%w: set the tenant session context: %w", mapPGError(err), err)
 	}
 	return nil
+}
+
+// mapPGError keeps a permanent privilege failure out of the retryable
+// ErrUnavailable bucket.
+func mapPGError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42501" {
+		return domain.ErrPermission
+	}
+	return domain.ErrUnavailable
 }
 
 // TenantTx is a Postgres transaction that already carries one tenant's
@@ -304,7 +316,7 @@ var (
 // CONVENTIONS.md's "Rendering a secret".
 func (s Scoped) String() string {
 	return fmt.Sprintf("tenancy.Scoped{tenant: %s, pool: %s, appRole: %q}",
-		s.tenant.ID, s.poolRow.ID, s.appRole)
+		s.tenant.ID, s.poolRef.ID, s.appRole)
 }
 
 // Format implements fmt.Formatter, the only interface fmt consults for every
@@ -323,7 +335,7 @@ func (s Scoped) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) 
 func (s Scoped) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("tenant_id", string(s.tenant.ID)),
-		slog.String("pool_id", string(s.poolRow.ID)),
+		slog.String("pool_id", string(s.poolRef.ID)),
 		slog.String("app_role", s.appRole),
 	)
 }

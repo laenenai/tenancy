@@ -203,7 +203,7 @@ func setupCredentials(t *testing.T, src CredentialSource) *credsEnv {
 func (e *credsEnv) issue(ctx context.Context, t *testing.T) tenancy.Credential {
 	t.Helper()
 
-	cred, err := e.src.Credentials.Issue(ctx, e.pool)
+	cred, err := e.src.Credentials.Issue(ctx, e.pool.Ref())
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -558,7 +558,7 @@ func testReleasedCredentialIsRefused(newSource func(t *testing.T) CredentialSour
 		e := setupCredentials(t, src)
 		ctx := context.Background()
 
-		cred, err := src.Credentials.Issue(ctx, e.pool)
+		cred, err := src.Credentials.Issue(ctx, e.pool.Ref())
 		if err != nil {
 			t.Fatalf("Issue: %v", err)
 		}

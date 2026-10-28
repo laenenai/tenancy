@@ -97,7 +97,7 @@
 // # The TTL the role issues is not a free choice
 //
 // A pool built on a credential expiring at T stops being handed to new
-// callers at T minus tenancy.CacheOptions.LongestTransaction, and the
+// callers at T minus tenancy.Config.LongestTransaction, and the
 // transactions already running on it have until T to finish. So the role's
 // default_ttl has a floor set by the slowest transaction the deployment
 // serves — not by a security preference — and a credential with less than
@@ -135,16 +135,20 @@ package openbao
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/laenenai/tenancy/internal/domain"
 )
@@ -158,6 +162,61 @@ const DefaultMountPath = "database"
 // takes every resolution that needs a new pool with it, so there is a
 // timeout by default rather than only when a caller remembers a deadline.
 const DefaultTimeout = 30 * time.Second
+
+// isLoopbackHost reports whether host is a loopback name or address. Plain
+// HTTP is allowed only there; a non-loopback bearer token must use TLS.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// redactedAddress removes userinfo, query and fragment from an address before
+// it reaches a log line or an error. Address is normally validated by Open,
+// but Config can be rendered before Open and an invalid address can contain a
+// secret.
+func redactedAddress(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+// secureClient applies the transport policy to the default client and to a
+// caller-supplied one: only same-origin HTTPS redirects are followed, and the
+// default transport requires TLS 1.2. A caller-supplied transport is left
+// alone, but its redirect policy is still wrapped.
+func secureClient(client *http.Client, base *url.URL) *http.Client {
+	if client == nil {
+		client = &http.Client{Timeout: DefaultTimeout}
+	}
+	copyClient := *client
+	original := copyClient.CheckRedirect
+	copyClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != base.Scheme || req.URL.Host != base.Host {
+			return http.ErrUseLastResponse
+		}
+		if original != nil {
+			return original(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	if copyClient.Transport == nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		copyClient.Transport = transport
+	}
+	return &copyClient
+}
 
 // maxResponseBytes bounds how much of a response this adapter reads. Every
 // response it expects is a few hundred bytes; the limit is what stops a
@@ -194,7 +253,7 @@ type Config struct {
 	// roles, and only the deployment knows which is which. Returning an
 	// error refuses the resolution; the error must not carry the pool's
 	// connection string.
-	RoleFor func(p domain.Pool) (string, error)
+	RoleFor func(p domain.PoolRef) (string, error)
 
 	// HTTPClient, when set, is used for every request, so a deployment can
 	// supply its own TLS configuration, proxy, connection pooling or
@@ -215,7 +274,7 @@ type Config struct {
 // String renders the configuration with the token redacted.
 func (c Config) String() string {
 	return fmt.Sprintf("openbao.Config{Address: %q, Token: %s, MountPath: %q, Role: %q, RoleFor: %s, Clock: %T}",
-		c.Address, domain.Redacted, c.MountPath, c.Role, roleForDescription(c.RoleFor), c.Clock)
+		redactedAddress(c.Address), domain.Redacted, c.MountPath, c.Role, roleForDescription(c.RoleFor), c.Clock)
 }
 
 // Format implements fmt.Formatter. String and LogValue are not enough on
@@ -234,7 +293,7 @@ func (c Config) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) 
 // redacted, so slog.Any("config", cfg) is safe under every handler.
 func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
-		slog.String("address", c.Address),
+		slog.String("address", redactedAddress(c.Address)),
 		slog.String("token", domain.Redacted),
 		slog.String("mount_path", c.MountPath),
 		slog.String("role", c.Role),
@@ -245,7 +304,7 @@ func (c Config) LogValue() slog.Value {
 // roleForDescription names whether a per-pool role function was supplied,
 // which is the part worth logging; the function value itself renders as an
 // address, and an address in a log line is noise.
-func roleForDescription(f func(p domain.Pool) (string, error)) string {
+func roleForDescription(f func(p domain.PoolRef) (string, error)) string {
 	if f == nil {
 		return "unset"
 	}
@@ -264,7 +323,7 @@ type Credentials struct {
 	token string
 	// role and roleFor decide which database role to issue from.
 	role    string
-	roleFor func(p domain.Pool) (string, error)
+	roleFor func(p domain.PoolRef) (string, error)
 
 	client *http.Client
 	clock  domain.Clock
@@ -293,13 +352,22 @@ func Open(ctx context.Context, cfg Config) (*Credentials, error) {
 	}
 	parsed, err := url.Parse(address)
 	if err != nil {
-		return nil, fmt.Errorf("%w: Address %q is not a URL: %w", domain.ErrInvalidConfig, cfg.Address, err)
+		return nil, fmt.Errorf("%w: Address is not a valid URL", domain.ErrInvalidConfig)
+	}
+	if parsed.User != nil {
+		return nil, fmt.Errorf("%w: Address must not contain userinfo; authenticate with the Token field", domain.ErrInvalidConfig)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("%w: Address must not contain a query or fragment", domain.ErrInvalidConfig)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("%w: Address %q must be an absolute http or https URL", domain.ErrInvalidConfig, cfg.Address)
+		return nil, fmt.Errorf("%w: Address must be an absolute http or https URL", domain.ErrInvalidConfig)
 	}
 	if parsed.Host == "" {
-		return nil, fmt.Errorf("%w: Address %q has no host", domain.ErrInvalidConfig, cfg.Address)
+		return nil, fmt.Errorf("%w: Address has no host", domain.ErrInvalidConfig)
+	}
+	if parsed.Scheme == "http" && !isLoopbackHost(parsed.Hostname()) {
+		return nil, fmt.Errorf("%w: Address must use https unless it is loopback", domain.ErrInvalidConfig)
 	}
 	if cfg.Token == "" {
 		return nil, fmt.Errorf("%w: Token is required", domain.ErrInvalidConfig)
@@ -316,10 +384,7 @@ func Open(ctx context.Context, cfg Config) (*Credentials, error) {
 		return nil, err
 	}
 
-	client := cfg.HTTPClient
-	if client == nil {
-		client = &http.Client{Timeout: DefaultTimeout}
-	}
+	client := secureClient(cfg.HTTPClient, parsed)
 	clock := cfg.Clock
 	if clock == nil {
 		clock = domain.SystemClock{}
@@ -352,7 +417,7 @@ func Open(ctx context.Context, cfg Config) (*Credentials, error) {
 // a retirement against, and the pool would then be replaced only when its
 // password had already been rotated out from under it. See the package doc
 // comment.
-func (c *Credentials) Issue(ctx context.Context, p domain.Pool) (domain.Credential, error) {
+func (c *Credentials) Issue(ctx context.Context, p domain.PoolRef) (domain.Credential, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.Credential{}, fmt.Errorf("tenancy/credentials/openbao: issue a credential: %w", err)
 	}
@@ -362,12 +427,11 @@ func (c *Credentials) Issue(ctx context.Context, p domain.Pool) (domain.Credenti
 		return domain.Credential{}, err
 	}
 
+	issuedAt := domain.CanonicalTime(c.clock.Now())
 	res, err := c.call(ctx, http.MethodGet, c.mount+"/creds/"+url.PathEscape(role), nil)
 	if err != nil {
 		return domain.Credential{}, classify(err, "issue a credential from role "+role)
 	}
-
-	issuedAt := domain.CanonicalTime(c.clock.Now())
 
 	if res.Data.Username == "" || res.Data.Password == "" {
 		return domain.Credential{}, fmt.Errorf(
@@ -403,6 +467,8 @@ func (c *Credentials) Issue(ctx context.Context, p domain.Pool) (domain.Credenti
 // role in Postgres and a stuck lease in OpenBao. That failure is returned
 // here rather than hidden, even though internal/pool discards it, so that a
 // deployment calling Release itself can see it.
+//
+// Release is safe for concurrent use: it holds no mutable per-call state.
 func (c *Credentials) Release(ctx context.Context, cred domain.Credential) error {
 	if cred.LeaseID == "" {
 		// Includes the zero Credential, which the port requires to be a
@@ -430,7 +496,7 @@ func (c *Credentials) Release(ctx context.Context, cred domain.Credential) error
 var _ domain.Credentials = (*Credentials)(nil)
 
 // roleName returns the database role to issue p's credential from.
-func (c *Credentials) roleName(p domain.Pool) (string, error) {
+func (c *Credentials) roleName(p domain.PoolRef) (string, error) {
 	if c.roleFor == nil {
 		return c.role, nil
 	}
@@ -496,7 +562,8 @@ func CreationStatements(appRole string) ([]string, error) {
 			domain.ErrInvalidConfig, appRole)
 	}
 	return []string{
-		`CREATE ROLE "{{name}}" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' IN ROLE ` + appRole + `;`,
+		`CREATE ROLE "{{name}}" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}' IN ROLE ` +
+			pgx.Identifier{appRole}.Sanitize() + `;`,
 	}, nil
 }
 
@@ -538,7 +605,7 @@ type RoleCheck struct {
 
 	// DefaultTTL and MaxTTL are the lease durations the role issues.
 	// DefaultTTL is the one to compare against
-	// tenancy.CacheOptions.LongestTransaction; see the package doc comment
+	// tenancy.Config.LongestTransaction; see the package doc comment
 	// for the floor.
 	DefaultTTL time.Duration
 	MaxTTL     time.Duration
@@ -735,6 +802,8 @@ func (c *Credentials) call(ctx context.Context, method, path string, body any) (
 		return nil, fmt.Errorf("read the response to %s: %w", method, err)
 	}
 
+	defer clear(raw)
+
 	ok := resp.StatusCode >= 200 && resp.StatusCode <= 299
 	var decoded response
 	if len(bytes.TrimSpace(raw)) > 0 {
@@ -805,7 +874,9 @@ func classify(err error, what string) error {
 	var apiErr *apiError
 	if errors.As(err, &apiErr) {
 		switch apiErr.status {
-		case http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed:
+		case http.StatusForbidden:
+			return fmt.Errorf("%w: openbao denied permission to %s: %w", domain.ErrPermission, what, err)
+		case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed:
 			return fmt.Errorf("%w: openbao refused to %s: %w", domain.ErrInvalidConfig, what, err)
 		}
 		return fmt.Errorf("%w: openbao could not %s: %w", domain.ErrUnavailable, what, err)
@@ -841,7 +912,7 @@ func mountPath(configured string) (string, error) {
 // what Open returns, so it is in scope wherever Open's error handling is, and
 // its token field is the credential that authenticates this process to
 // OpenBao.
-func (c *Credentials) String() string {
+func (c Credentials) String() string {
 	return fmt.Sprintf("openbao.Credentials{base: %q, mount: %q, token: %s, role: %q, roleFor: %s}",
 		c.base, c.mount, domain.Redacted, c.role, roleForDescription(c.roleFor))
 }
@@ -853,10 +924,10 @@ func (c *Credentials) Format(s fmt.State, _ rune) { _, _ = io.WriteString(s, c.S
 // MarshalJSON renders the redacted summary. encoding/json skips unexported
 // fields, so a *Credentials already marshalled to "{}" — safety by accident,
 // which ends the moment a field is exported.
-func (c *Credentials) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+func (c Credentials) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
 
 // LogValue renders the source as a slog group with the token redacted.
-func (c *Credentials) LogValue() slog.Value {
+func (c Credentials) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("address", c.base),
 		slog.String("mount_path", c.mount),

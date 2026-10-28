@@ -47,6 +47,7 @@ func TestCredentialsConformance(t *testing.T) {
 			Deployment: tenancytest.Deployment{
 				MigrationDSN: db.DSN(),
 				AppRole:      testdb.AppRole,
+				ControlRole:  testdb.ControlRole,
 			},
 			Dynamic: true,
 		}
@@ -324,7 +325,7 @@ func newEndToEnd(t *testing.T, longestTransaction time.Duration) *endToEnd {
 	// Migrate first: it is what ensures the application role exists, and
 	// the credential OpenBao issues is created IN ROLE that role, so a
 	// credential issued before this would fail at CREATE ROLE.
-	if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{DSN: db.DSN(), AppRole: testdb.AppRole}); err != nil {
+	if err := tenancy.Migrate(ctx, tenancy.MigrateConfig{DSN: db.DSN(), AppRole: testdb.AppRole, ControlRole: testdb.ControlRole}); err != nil {
 		t.Fatalf("tenancy.Migrate: %v", err)
 	}
 
@@ -362,22 +363,19 @@ func newEndToEnd(t *testing.T, longestTransaction time.Duration) *endToEnd {
 	// TestIssuedCredentialIsFailClosedUnderEnforcement for why that is the
 	// stronger configuration rather than a missing setting.
 	ten, err := tenancy.Open(ctx, tenancy.Config{
-		RegistryDSN: db.DSN(),
-		Clock:       clock,
-		Credentials: source,
-		Postgres:    tenancy.PoolConfig{MaxConns: 4, ApplicationName: "openbao-integration"},
-		Cache: tenancy.CacheOptions{
-			TTL:                time.Hour,
-			NegativeTTL:        time.Hour,
-			LongestTransaction: longestTransaction,
-		},
+		RegistryDSN:        db.DSN(),
+		Clock:              clock,
+		Credentials:        source,
+		Postgres:           tenancy.PoolConfig{MaxConns: 4, ApplicationName: "openbao-integration"},
+		LongestTransaction: longestTransaction,
+		Cache:              tenancy.CacheOptions{TTL: time.Hour, NegativeTTL: time.Hour},
 	})
 	if err != nil {
 		t.Fatalf("tenancy.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = ten.Close() })
 
-	p, err := ten.Control().CreatePool(ctx, tenancy.NewPool{
+	p, err := ten.Control().CreatePool(ctx, tenancy.PoolSpec{
 		Name:           "pool-openbao",
 		Region:         "test-region",
 		MetadataDSN:    db.DSN(),
@@ -387,7 +385,7 @@ func newEndToEnd(t *testing.T, longestTransaction time.Duration) *endToEnd {
 	if err != nil {
 		t.Fatalf("CreatePool: %v", err)
 	}
-	tenant, err := ten.Control().CreateTenant(ctx, tenancy.NewTenant{
+	tenant, err := ten.Control().CreateTenant(ctx, tenancy.TenantSpec{
 		PoolID:       p.ID,
 		Name:         "tenant-openbao",
 		SecurityMode: tenancy.SecurityModeManaged,

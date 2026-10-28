@@ -341,8 +341,8 @@ func TestResolve_PositiveEntryExpiresAtTTL(t *testing.T) {
 
 	clock := domain.NewFixedClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
 	r := pool.NewResolver(reg, countingOpener(new(int32)), pool.Options{
-		TTL: time.Minute, NegativeTTL: time.Minute, MaxPools: 10, Clock: clock,
-	})
+		TTL: time.Minute, NegativeTTL: time.Minute, MaxPools: 10,
+	}, pool.LifecycleOptions{Clock: clock})
 	t.Cleanup(func() { _ = r.Close() })
 
 	ctx := context.Background()
@@ -366,8 +366,8 @@ func TestResolve_NegativeResultExpires(t *testing.T) {
 
 	clock := domain.NewFixedClock(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
 	r := pool.NewResolver(reg, countingOpener(new(int32)), pool.Options{
-		TTL: time.Minute, NegativeTTL: 20 * time.Millisecond, MaxPools: 10, Clock: clock,
-	})
+		TTL: time.Minute, NegativeTTL: 20 * time.Millisecond, MaxPools: 10,
+	}, pool.LifecycleOptions{Clock: clock})
 	t.Cleanup(func() { _ = r.Close() })
 
 	ctx := context.Background()
@@ -882,4 +882,32 @@ func TestClose_IsIdempotentAndRaceSafeDuringResolve(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+func TestResolve_InvalidateTenantDropsAWarmEntry(t *testing.T) {
+	reg := newFakeRegistry()
+	tenantID := domain.NewTenantID(domain.SystemClock{})
+	poolID := domain.NewPoolID(domain.SystemClock{})
+	reg.setTenant(activeTenant(tenantID, poolID))
+	reg.setPool(testPool(poolID, fakeDSN("invalidate")))
+
+	r := pool.NewResolver(reg, countingOpener(new(int32)), pool.Options{TTL: time.Hour, NegativeTTL: time.Hour})
+	t.Cleanup(func() { _ = r.Close() })
+
+	ctx := context.Background()
+	mustResolve(ctx, t, r, tenantID)
+	if got := atomic.LoadInt32(&reg.tenantCalls); got != 1 {
+		t.Fatalf("TenantByID called %d times before invalidation, want 1", got)
+	}
+
+	r.InvalidateTenant(tenantID)
+	mustResolve(ctx, t, r, tenantID)
+	if got := atomic.LoadInt32(&reg.tenantCalls); got != 2 {
+		t.Fatalf("TenantByID called %d times after invalidation, want 2", got)
+	}
+
+	stats := r.Stats()
+	if stats.OpenPools != 1 || stats.PositiveTenants != 1 {
+		t.Errorf("Stats() = %+v, want one open pool and one positive tenant", stats)
+	}
 }

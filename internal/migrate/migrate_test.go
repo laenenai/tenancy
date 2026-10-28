@@ -148,9 +148,11 @@ func TestUpRejectsAnIncompleteConfig(t *testing.T) {
 		name string
 		cfg  migrate.Config
 	}{
-		{"no DSN", migrate.Config{AppRole: "app"}},
-		{"no AppRole", migrate.Config{DSN: "postgres:///x"}},
-		{"AppRole is not a plain identifier", migrate.Config{DSN: "postgres:///x", AppRole: "app role; DROP"}},
+		{"no DSN", migrate.Config{AppRole: "app", ControlRole: "control"}},
+		{"no AppRole", migrate.Config{DSN: "postgres:///x", ControlRole: "control"}},
+		{"no ControlRole", migrate.Config{DSN: "postgres:///x", AppRole: "app"}},
+		{"AppRole is not a plain identifier", migrate.Config{DSN: "postgres:///x", AppRole: "app role; DROP", ControlRole: "control"}},
+		{"ControlRole is not a plain identifier", migrate.Config{DSN: "postgres:///x", AppRole: "app", ControlRole: "control role; DROP"}},
 	}
 
 	for _, tc := range cases {
@@ -160,10 +162,11 @@ func TestUpRejectsAnIncompleteConfig(t *testing.T) {
 			if err := migrate.Up(context.Background(), tc.cfg); !errors.Is(err, domain.ErrInvalidConfig) {
 				t.Fatalf("Up() error = %v, want ErrInvalidConfig", err)
 			}
-			if _, err := migrate.Status(context.Background(), tc.cfg); !errors.Is(err, domain.ErrInvalidConfig) {
-				t.Fatalf("Status() error = %v, want ErrInvalidConfig", err)
-			}
 		})
+	}
+
+	if _, err := migrate.Status(context.Background(), migrate.Config{}); !errors.Is(err, domain.ErrInvalidConfig) {
+		t.Fatalf("Status() with no DSN error = %v, want ErrInvalidConfig", err)
 	}
 }
 

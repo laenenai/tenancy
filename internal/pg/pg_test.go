@@ -94,7 +94,7 @@ func TestRegistryTablesAreNamedExemptions(t *testing.T) {
 	t.Parallel()
 
 	for _, table := range []string{"tenancy.pools", "tenancy.tenants"} {
-		reason, ok := pg.RegistryTablesExemptFromRLS[table]
+		reason, ok := pg.RegistryTablesExemptFromRLS()[table]
 		if !ok {
 			t.Fatalf("%s is not in RegistryTablesExemptFromRLS: the coverage sweep would report it, and "+
 				"someone would \"fix\" it by adding a policy that stops the resolver reading the row that "+
@@ -104,9 +104,9 @@ func TestRegistryTablesAreNamedExemptions(t *testing.T) {
 			t.Errorf("%s's exemption reason is %q, which does not say why", table, reason)
 		}
 	}
-	if len(pg.RegistryTablesExemptFromRLS) != 2 {
+	if len(pg.RegistryTablesExemptFromRLS()) != 2 {
 		t.Errorf("RegistryTablesExemptFromRLS has %d entries, want 2: this list is the one place it may grow, "+
-			"and growing it is a decision", len(pg.RegistryTablesExemptFromRLS))
+			"and growing it is a decision", len(pg.RegistryTablesExemptFromRLS()))
 	}
 }
 
@@ -172,26 +172,31 @@ func TestEnableRLSRejectsAnIdentifierThatIsNotSchemaQualified(t *testing.T) {
 	}
 }
 
-func TestIsRLSViolation(t *testing.T) {
+func TestRLSPredicates(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name string
-		err  error
-		want bool
+		name         string
+		err          error
+		insufficient bool
+		policy       bool
 	}{
-		{"nil", nil, false},
-		{"a plain error", errors.New("something went wrong"), false},
-		{"a different SQLSTATE", &pgconn.PgError{Code: "23505"}, false},
-		{"42501", &pgconn.PgError{Code: pg.RLSViolationCode}, true},
-		{"42501, wrapped", errors.Join(errors.New("context"), &pgconn.PgError{Code: pg.RLSViolationCode}), true},
+		{"nil", nil, false, false},
+		{"a plain error", errors.New("something went wrong"), false, false},
+		{"a different SQLSTATE", &pgconn.PgError{Code: "23505"}, false, false},
+		{"42501 missing grant", &pgconn.PgError{Code: pg.RLSViolationCode, Message: "permission denied for table documents"}, true, false},
+		{"42501 policy", &pgconn.PgError{Code: pg.RLSViolationCode, Message: `new row violates row-level security policy for table "documents"`}, true, true},
+		{"42501 policy, wrapped", errors.Join(errors.New("context"), &pgconn.PgError{Code: pg.RLSViolationCode, Message: "new row violates row-level security policy"}), true, true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := pg.IsRLSViolation(tc.err); got != tc.want {
-				t.Fatalf("IsRLSViolation(%v) = %v, want %v", tc.err, got, tc.want)
+			if got := pg.IsInsufficientPrivilege(tc.err); got != tc.insufficient {
+				t.Errorf("IsInsufficientPrivilege(%v) = %v, want %v", tc.err, got, tc.insufficient)
+			}
+			if got := pg.IsRLSPolicyViolation(tc.err); got != tc.policy {
+				t.Errorf("IsRLSPolicyViolation(%v) = %v, want %v", tc.err, got, tc.policy)
 			}
 		})
 	}
@@ -224,6 +229,7 @@ func TestEnforcementFindingsDistinguishEveryBypass(t *testing.T) {
 		Tables: []pg.TableEnforcement{{
 			Table: "x.y", Exists: true,
 			RowSecurityEnabled: true, RowSecurityForced: true, PolicyPresent: true,
+			PolicyHasCheck: true, PolicyMatchesPredicate: true, AccessPolicyPresent: true,
 			RowSecurityActive: true,
 		}},
 	}
@@ -242,11 +248,14 @@ func TestEnforcementFindingsDistinguishEveryBypass(t *testing.T) {
 		{"table missing", func(e *pg.Enforcement) { e.Tables[0].Exists = false }, "does not exist"},
 		{"rls not enabled", func(e *pg.Enforcement) { e.Tables[0].RowSecurityEnabled = false }, "row-level security enabled"},
 		{"no policy", func(e *pg.Enforcement) { e.Tables[0].PolicyPresent = false }, "carries no"},
+		{"no with check", func(e *pg.Enforcement) { e.Tables[0].PolicyHasCheck = false }, "WITH CHECK"},
+		{"wrong predicate", func(e *pg.Enforcement) { e.Tables[0].PolicyMatchesPredicate = false }, "does not look like"},
+		{"no permissive companion", func(e *pg.Enforcement) { e.Tables[0].AccessPolicyPresent = false }, "permissive companion"},
 		{"not forced", func(e *pg.Enforcement) { e.Tables[0].RowSecurityForced = false }, "FORCEd"},
 		{
-			"not forced and owned by the role",
-			func(e *pg.Enforcement) { e.Tables[0].RowSecurityForced = false; e.Tables[0].OwnedByRole = true },
-			"does not bind the role that runs the statements",
+			"owned by the role even with FORCE",
+			func(e *pg.Enforcement) { e.Tables[0].OwnedByRole = true },
+			"owned by",
 		},
 		// The authoritative measurement, and the one case every field
 		// above is only an input to: Postgres says this role's statements
@@ -280,17 +289,34 @@ func TestEnforcementFindingsDistinguishEveryBypass(t *testing.T) {
 		})
 	}
 
-	// An application role that merely *owns* a FORCEd table is a finding
-	// about hygiene, not about enforcement: FORCE covers it. The verdict
-	// must stay fail-closed, or a correct deployment would be refused.
+	// An owner can disable RLS or drop the policy even when FORCE is set,
+	// so ownership is a finding regardless of FORCE.
 	ownedButForced := healthy
 	ownedButForced.Tables = []pg.TableEnforcement{{
 		Table: "x.y", Exists: true,
-		RowSecurityEnabled: true, RowSecurityForced: true, PolicyPresent: true, OwnedByRole: true,
-		RowSecurityActive: true,
+		RowSecurityEnabled: true, RowSecurityForced: true, PolicyPresent: true,
+		PolicyHasCheck: true, PolicyMatchesPredicate: true, AccessPolicyPresent: true,
+		OwnedByRole: true, RowSecurityActive: true,
 	}}
-	if !ownedButForced.FailClosed() {
-		t.Errorf("owning a FORCEd table is reported as not fail-closed, but FORCE is exactly what covers "+
-			"the owner exemption: %v", ownedButForced.Findings())
+	if ownedButForced.FailClosed() {
+		t.Error("owning a FORCEd table is reported as fail-closed, but an owner can still disable RLS or drop the policy")
+	}
+}
+
+func TestRegistryTablesExemptFromRLSReturnsACopy(t *testing.T) {
+	t.Parallel()
+
+	first := pg.RegistryTablesExemptFromRLS()
+	delete(first, "tenancy.tenants")
+	if _, ok := pg.RegistryTablesExemptFromRLS()["tenancy.tenants"]; !ok {
+		t.Fatal("mutating the returned map removed the tenants exemption from the global list")
+	}
+}
+
+func TestZeroEnforcementIsNotFailClosed(t *testing.T) {
+	t.Parallel()
+
+	if (pg.Enforcement{}).FailClosed() {
+		t.Fatal("the zero Enforcement reports fail-closed; a zero value means nothing was measured")
 	}
 }
