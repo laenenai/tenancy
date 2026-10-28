@@ -236,6 +236,60 @@ func (t TenantTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	return t.tx.QueryRow(ctx, sql, args...)
 }
 
+// String names the tenant and nothing else.
+//
+// Why this exists, stated precisely, because the obvious reason turns out to be
+// false. CAS's adoption reported that TenantTx reaches the connection's
+// password: it holds a pgx.Tx in an unexported field, a pgx.Tx reaches the
+// connection it was begun on, and a connection holds its configuration. That
+// chain is real but fmt does not walk it. Measured on go1.25.6 against a live
+// transaction with a real password in the DSN: with String alone and no
+// Formatter, every verb that bypasses Stringer prints
+//
+//	{%!U(*pgxpool.Tx=&{0xc000305dd0 0xc000430ce8}) …}
+//
+// pointer values, not pointee contents, because fmt dereferences a pointer only
+// at the top level. Zero renderings disclosed the password.
+//
+// So these four are not closing a disclosure, and claiming they were would put
+// a false reason in the one place someone later reads to decide whether the
+// rule still applies. What they close is that the verbs bypassing Stringer
+// printed raw internals — a goroutine-varying address and the tenant id as
+// decimal — which is unstable, says nothing a reader can act on, and makes the
+// rendering depend on pgx's field layout rather than on a decision here. A
+// value whose shape is someone else's implementation detail should not be
+// printable by accident.
+//
+// Scoped is the type where the hole was real: its pool row is a struct held by
+// value, so fmt reflected straight through domain.DSN's own redaction and
+// printed the password under %v, %+v, %#v, %s, %q, %d and slog's TextHandler.
+// That difference — a value field versus a pointer field — is the whole reason
+// one was a leak and this is not.
+func (t TenantTx) String() string {
+	return "tenancy.TenantTx{tenant: " + string(t.tenant) + "}"
+}
+
+// Format redacts TenantTx under every verb. It is the load-bearing one: fmt
+// consults fmt.Stringer for %v, %s, %q, %x and %X and for no other verb, so
+// %+v and %#v would otherwise reflect the whole subtree.
+func (t TenantTx) Format(st fmt.State, _ rune) { _, _ = io.WriteString(st, t.String()) }
+
+// MarshalJSON redacts TenantTx, because encoding/json consults neither String
+// nor LogValue — and so neither does slog's JSONHandler, which is built on it.
+func (t TenantTx) MarshalJSON() ([]byte, error) { return json.Marshal(t.String()) }
+
+// LogValue redacts TenantTx as a structured log attribute under every handler.
+func (t TenantTx) LogValue() slog.Value { return slog.StringValue(t.String()) }
+
+// Compile-time proof that the four interfaces stay implemented: deleting one
+// becomes a build failure rather than a silently widened rendering.
+var (
+	_ fmt.Stringer   = TenantTx{}
+	_ fmt.Formatter  = TenantTx{}
+	_ json.Marshaler = TenantTx{}
+	_ slog.LogValuer = TenantTx{}
+)
+
 // String names the tenant, the pool and the application role, and redacts the
 // pool's MetadataDSN.
 //

@@ -242,7 +242,7 @@ func Start(t *testing.T, opts ...Option) *DB {
 	var pool *pgxpool.Pool
 	t.Cleanup(func() {
 		if pool != nil {
-			pool.Close()
+			closePoolBounded(t, pool)
 		}
 		dropDatabase(t, serverDSN, dbName)
 	})
@@ -296,6 +296,44 @@ func openPool(ctx context.Context, dsn domain.DSN) (*pgxpool.Pool, error) {
 // but pgxpool's close does not guarantee every socket is already torn down
 // server-side. It logs rather than fails: best-effort cleanup is
 // preferable to masking the test's real result.
+// poolCloseTimeout bounds the wait for a pool to close during cleanup. It is
+// generous because a healthy close is immediate, so anything approaching this
+// is a leak rather than slowness.
+const poolCloseTimeout = 10 * time.Second
+
+// closePoolBounded closes the pool but refuses to wait forever for it.
+//
+// pgxpool.Pool.Close blocks until every connection is returned, so a subtest
+// that fails while holding a transaction — t.Fatalf calls runtime.Goexit, which
+// runs deferred functions but cannot roll back a transaction nobody deferred —
+// leaves a connection checked out and this cleanup waiting on it. The symptom
+// is not a failing test but the whole package timing out, with the real
+// assertion failure scrolled off above it. That happened: a one-line assertion
+// error in a consumer presented as a ten-minute hang.
+//
+// Waiting is bounded instead, and exceeding the bound is reported rather than
+// swallowed, because a leaked connection is a defect in the test that leaked it
+// and the author should see it named. Dropping the database afterwards is safe
+// regardless: dropDatabase uses WITH (FORCE), which terminates whatever is
+// still attached.
+func closePoolBounded(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+
+	closed := make(chan struct{})
+	go func() {
+		pool.Close()
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(poolCloseTimeout):
+		t.Logf("testdb: cleanup: the pool did not close within %s, so a connection is still "+
+			"checked out — most likely a transaction left open by a subtest that failed while "+
+			"holding one. Dropping the database with FORCE anyway.", poolCloseTimeout)
+	}
+}
+
 func dropDatabase(t *testing.T, serverDSN, name string) {
 	t.Helper()
 
