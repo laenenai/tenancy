@@ -31,8 +31,15 @@ jobs:
       - name: gorelease
         if: startsWith(github.ref_name, 'v')
         run: |
+          # "latest" resolves to the tag being released, which makes gorelease
+          # compare the tag with itself. Use the previous tag instead.
+          base="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [[ -z "${base}" ]]; then
+            base=none
+          fi
+          echo "gorelease base: ${base}"
           go run golang.org/x/exp/cmd/gorelease@v0.0.0-20261014143641-f0251eb4aa3e \
-            -base=latest -version="${GITHUB_REF_NAME}"
+            -base="${base}" -version="${GITHUB_REF_NAME}"
 
       # The nested harness has its own tag prefix. Its replace directive is a
       # local-development aid; publish the root module first, then update and
