@@ -11,7 +11,8 @@ on this repository, rather than opening a public issue.
 | Version | Supported |
 |---|---|
 | `main` (unreleased) | security fixes land here first |
-| `v0.3.x` | best effort; upgrade to `main` for the production-readiness fixes |
+| `v0.4.x` | supported |
+| `v0.3.x` | best effort; upgrade to `v0.4.x` |
 | `< v0.3` | not supported |
 
 The module is **pre-1.0**. The API may change, and it has not had an external

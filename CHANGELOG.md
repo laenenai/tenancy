@@ -6,6 +6,8 @@ release may break the API. See `UPGRADING.md` for the steps.
 
 ## Unreleased
 
+## v0.4.0 — 2026-10-28
+
 This is the production-readiness change set from
 [`docs/review/20261028_review.md`](docs/review/20261028_review.md).
 

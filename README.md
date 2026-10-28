@@ -6,11 +6,10 @@
 Who the tenants are, where their data lives, and a pgx connection already
 scoped to exactly one of them — failing closed if it is not.
 
-> **Status: pre-1.0.** Tags `v0.1.0`, `v0.2.0` and `v0.3.0` exist; `main` is
-> newer and unreleased. Minor versions may break the API, and the
+> **Status: pre-1.0.** Release `v0.4.0` is the production-readiness change set;
+> `main` may be newer. Minor versions may break the API, and the
 > [`CHANGELOG`](CHANGELOG.md) plus [`UPGRADING`](UPGRADING.md) say what
-> changed. The API is not frozen until the P0/P1 work in
-> [`docs/review/20261028_review.md`](docs/review/20261028_review.md) is done.
+> changed. The API is not frozen until 1.0.
 
 ## What it does
 

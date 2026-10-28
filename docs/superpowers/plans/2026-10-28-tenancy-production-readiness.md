@@ -243,15 +243,15 @@
 
 ## Execution record (2026-10-28)
 
-All tasks were implemented inline in the working tree. No commits were made
-because the user did not ask for one; the changes are reviewable with
-`git diff` and `git status`.
+All tasks were implemented inline and the result was committed to `main` and
+pushed to `origin/main`. The release tags are created after the final main CI
+run.
 
 - Final gate: `mise run check` passes — fmt-check, golangci-lint (0 issues),
   cgo-free build, race/container tests across every module, sqlc diff,
   govulncheck (no vulnerabilities), and `api-diff` (incompatible changes
   reported for the pre-1.0 release).
-- Combined coverage across the root and nested integration modules: 79.5% statements.
+- Combined coverage across the root and nested integration modules: 79.6% statements.
 - New nested modules: `testdb`, `integration`, `internal/pg/integration`, and
   `credentials/openbao/integration`; the root `go.mod` no longer requires
   testcontainers.
